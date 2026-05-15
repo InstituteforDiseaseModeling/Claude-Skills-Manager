@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-skills-manager"
+description = "Discover, browse, and edit local Claude Code skills with a three-pane PySide6 desktop GUI."
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Zhaowei Du", email = "zdu@idmod.org" },
+    { name = "Sharon Chen", email = "shchen@idmod.org" },
+]
+keywords = ["claude", "claude-code", "skills", "pyside6", "qt", "gui"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: X11 Applications :: Qt",
+    "Environment :: Win32 (MS Windows)",
+    "Environment :: MacOS X",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development",
+    "Topic :: Text Editors",
+]
+dependencies = [
+    "PySide6>=6.6",
+    "PyYAML>=6.0",
+]
+dynamic = ["version"]
+
+[project.gui-scripts]
+claude-skills-manager = "main:main"
+
+[tool.setuptools]
+# main.py sits at the repo root, not inside the package, so auto-discovery
+# would miss it. The gui-scripts entry point above resolves "main:main",
+# so the module must be installed alongside the package.
+py-modules = ["main"]
+
+[tool.setuptools.packages.find]
+include = ["claude_skills_manager*"]
+exclude = ["tests*", ".venv*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "claude_skills_manager.__version__" }
