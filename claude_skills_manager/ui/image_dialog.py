@@ -11,11 +11,28 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QPainter, QPixmap
+from PySide6.QtGui import QImageReader, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QDialog, QGraphicsPixmapItem, QGraphicsScene, QGraphicsView, QHBoxLayout,
     QLabel, QMessageBox, QPushButton, QVBoxLayout, QWidget,
 )
+
+
+def _supported_image_exts() -> frozenset[str]:
+    """Return the set of file extensions Qt's currently-loaded image
+    plugins can decode (e.g. ``{'.png', '.jpg', '.svg', ...}``).
+
+    Computed at call time, not module-import time, because the SVG
+    plugin registers itself lazily on ``import QtSvg`` above — so the
+    answer depends on whether that import succeeded. Using Qt's own
+    list (instead of a hardcoded set) keeps sibling discovery in
+    lock-step with what ``_load`` will actually accept: a folder
+    listing that includes an extension Qt can't open would let the
+    user page to an image that immediately fails."""
+    return frozenset(
+        "." + bytes(fmt).decode("ascii").lower()
+        for fmt in QImageReader.supportedImageFormats()
+    )
 
 # Importing QtSvg here registers Qt's SVG image plugin so QPixmap can load
 # .svg files. Without it, SVG paths return null pixmaps. The import is
@@ -90,6 +107,16 @@ class ImageDialog(QDialog):
         self.setWindowTitle(path.name)
         self.resize(900, 700)
 
+        # Discover sibling images in the same folder so the user can
+        # page through them with the toolbar arrows / Left-Right keys.
+        # Computed once at __init__: if the user adds or removes files
+        # mid-session, they need to close + reopen to pick up changes.
+        # Worth it — re-scanning on every keystroke would race with
+        # user navigation (and a network folder could stall the UI).
+        self._siblings: list[Path] = []
+        self._index: int = 0
+        self._build_siblings(path)
+
         # Scene + item: the pixmap is owned by an item placed in a scene,
         # which is rendered by the view. Single-image case, but the whole
         # framework still buys us GPU-smooth transforms, scrollbars, and
@@ -114,6 +141,30 @@ class ImageDialog(QDialog):
         # ---- Toolbar ----
         bar = QHBoxLayout()
         bar.setSpacing(4)
+        # Navigation arrows come first — same left-to-right reading order
+        # as the keyboard shortcuts (Left = prev, Right = next), so users
+        # don't have to remember which is which.
+        self._prev_btn = QPushButton("◀")
+        self._next_btn = QPushButton("▶")
+        self._prev_btn.setToolTip(
+            "Previous image in this folder (Left arrow / Page Up)")
+        self._next_btn.setToolTip(
+            "Next image in this folder (Right arrow / Page Down)")
+        self._prev_btn.clicked.connect(self.show_prev)
+        self._next_btn.clicked.connect(self.show_next)
+        # Position label between the arrows — Apple Photos / file-explorer
+        # style "3 / 17" so the user knows where they are in the run.
+        self._pos_label = QLabel("—")
+        self._pos_label.setStyleSheet("color: #444; padding: 0 6px;")
+        self._pos_label.setMinimumWidth(56)
+        self._pos_label.setAlignment(Qt.AlignCenter)
+        for btn in (self._prev_btn, self._next_btn):
+            btn.setFixedWidth(36)
+        bar.addWidget(self._prev_btn)
+        bar.addWidget(self._pos_label)
+        bar.addWidget(self._next_btn)
+        bar.addSpacing(12)
+
         fit_btn    = QPushButton("Fit")
         actual_btn = QPushButton("100%")
         out_btn    = QPushButton("−")
@@ -146,7 +197,27 @@ class ImageDialog(QDialog):
         # their manual zoom level survives subsequent window resizes.
         self._fit_mode = True
 
-        self._load(path)
+        # Dialog-level shortcuts for navigation. Using QShortcut instead
+        # of keyPressEvent because QGraphicsView (the focus widget once
+        # the user pans / clicks the image) consumes plain Left/Right
+        # arrow events to scroll its viewport — so a keyPressEvent
+        # override on the dialog never sees them. QShortcut bypasses
+        # focus-based key routing and fires at the dialog level.
+        for keys, slot in (
+            ((Qt.Key_Left, Qt.Key_PageUp), self.show_prev),
+            ((Qt.Key_Right, Qt.Key_PageDown), self.show_next),
+        ):
+            for key in keys:
+                QShortcut(QKeySequence(key), self).activated.connect(slot)
+
+        if not self._load(self._siblings[self._index]):
+            # Initial path failed to load — defer reject so the warning
+            # box actually paints before the dialog disappears. (Same
+            # deferral the legacy _load() did inline; pulled out here
+            # so navigation failures can choose a different policy.)
+            QTimer.singleShot(0, self.reject)
+            return
+        self._update_nav_state()
 
     # ----------------------------------------------------------- public API
     def fit_to_window(self) -> None:
@@ -171,8 +242,90 @@ class ImageDialog(QDialog):
     def zoom_out(self) -> None:
         self._view.zoom_centered(1.0 / _ZoomPanView._ZOOM_STEP)
 
+    def show_prev(self) -> None:
+        """Page to the previous image in the folder. No-op at index 0."""
+        self._navigate_to(self._index - 1)
+
+    def show_next(self) -> None:
+        """Page to the next image in the folder. No-op at last index."""
+        self._navigate_to(self._index + 1)
+
     # ----------------------------------------------------------- internals
-    def _load(self, path: Path) -> None:
+    def _build_siblings(self, path: Path) -> None:
+        """Populate ``self._siblings`` with image files in ``path.parent``,
+        sorted by case-insensitive filename so the order matches what the
+        OS file explorer typically shows. ``self._index`` is set to
+        ``path``'s position in that list.
+
+        Defensive fallbacks: if the directory can't be listed (permission
+        error, network mount went away) or contains no recognizable
+        images, the list collapses to ``[path]`` so the dialog still
+        works — just with nav disabled."""
+        try:
+            entries = list(path.parent.iterdir())
+        except OSError:
+            self._siblings = [path]
+            self._index = 0
+            return
+        exts = _supported_image_exts()
+        images = sorted(
+            (p for p in entries
+             if p.is_file() and p.suffix.lower() in exts),
+            key=lambda p: p.name.lower(),
+        )
+        if not images:
+            self._siblings = [path]
+            self._index = 0
+            return
+        try:
+            resolved = path.resolve()
+            idx = next(i for i, p in enumerate(images)
+                       if p.resolve() == resolved)
+        except (StopIteration, OSError):
+            # Opened image isn't in the sibling list (unusual extension,
+            # symlink resolution mismatch, etc.). Stitch it onto the
+            # front so the dialog still loads it.
+            images.insert(0, path)
+            idx = 0
+        self._siblings = images
+        self._index = idx
+
+    def _navigate_to(self, new_index: int) -> None:
+        """Page to ``new_index`` in the siblings list. Out-of-bounds is a
+        no-op (the buttons are already disabled at boundaries, but the
+        check is here too for the keyboard-shortcut path, which doesn't
+        consult button state). On load failure the previous image stays
+        visible and ``_index`` doesn't advance — failure mode the
+        sibling-discovery extension filter is supposed to prevent, but
+        e.g. a corrupted PNG would still trip it."""
+        if not (0 <= new_index < len(self._siblings)):
+            return
+        target = self._siblings[new_index]
+        if not self._load(target):
+            return  # _load already showed the warning; keep current image
+        self._index = new_index
+        self.setWindowTitle(target.name)
+        self._update_nav_state()
+
+    def _update_nav_state(self) -> None:
+        """Refresh the Prev/Next enabled state and the ``N / M`` label.
+        Called after every navigation and once from ``__init__``. Both
+        buttons are disabled when there's only one image (collapses to
+        a viewer with no nav surface)."""
+        total = len(self._siblings)
+        self._prev_btn.setEnabled(self._index > 0)
+        self._next_btn.setEnabled(self._index < total - 1)
+        if total <= 1:
+            self._pos_label.setText("—")
+        else:
+            self._pos_label.setText(f"{self._index + 1} / {total}")
+
+    def _load(self, path: Path) -> bool:
+        """Load ``path`` into the scene. Returns True on success, False on
+        failure (in which case a warning has been shown and the scene
+        retains whatever was previously displayed). The caller decides
+        what to do on False — the initial-load path rejects the dialog
+        outright, navigation just stays on the current image."""
         pix = QPixmap(str(path))
         if pix.isNull():
             QMessageBox.warning(
@@ -180,18 +333,18 @@ class ImageDialog(QDialog):
                 f"{path.name} could not be loaded as an image. The format "
                 f"may not be supported by Qt's bundled image plugins (e.g. "
                 f"SVG without QtSvg, animated GIF, corrupt file).")
-            # Defer reject() to the next event-loop tick so the warning
-            # actually shows before the dialog disappears.
-            QTimer.singleShot(0, self.reject)
-            return
+            return False
         self._pixmap_item.setPixmap(pix)
         self._scene.setSceneRect(self._pixmap_item.boundingRect())
         self._dims_label.setText(f"{pix.width()}×{pix.height()} px")
-        # Defer the initial fit until the view has been laid out — fitInView
-        # before the dialog is shown would use the placeholder size and
-        # produce a wrong fit. Singleshot(0) defers to the next tick after
-        # the layout system has settled.
+        # Re-arm fit-mode and refit on the next tick — a navigation
+        # carries no expectation that a previous zoom level should apply
+        # to a totally different image. Deferred via singleshot so the
+        # view's layout has settled (relevant on first show; harmless on
+        # subsequent navigations).
+        self._fit_mode = True
         QTimer.singleShot(0, self.fit_to_window)
+        return True
 
     def _on_user_zoom(self) -> None:
         """Slot for view.zoom_changed — any user-initiated zoom turns off

@@ -12,7 +12,7 @@ import math
 
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import (
-    QBrush, QColor, QIcon, QPainter, QPen, QPixmap, QPolygonF,
+    QBrush, QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap, QPolygonF,
 )
 
 
@@ -21,6 +21,10 @@ from PySide6.QtGui import (
 # per-type icon caches in skill_list.py.
 _search_icon_cache: QIcon | None = None
 _refresh_icon_cache: QIcon | None = None
+_test_icon_cache: QIcon | None = None
+_eye_icon_cache: QIcon | None = None
+_eye_slash_icon_cache: QIcon | None = None
+_close_icon_cache: QIcon | None = None
 
 
 def search_icon() -> QIcon:
@@ -152,3 +156,187 @@ def refresh_icon() -> QIcon:
 
     _refresh_icon_cache = QIcon(pix)
     return _refresh_icon_cache
+
+
+def test_icon() -> QIcon:
+    """Return (and lazily build + cache) a stroked Erlenmeyer-flask icon
+    for the 'Test Skill…' toolbar button (§7.34).
+
+    Shape rationale: a conical body + short neck + horizontal liquid
+    line is the universally-readable 'lab test' silhouette — distinct
+    in both color-vision-safe ways AND shape from the magnifying glass
+    (rounded) and refresh arrow (circular) already in the toolbar, so
+    the three icons coexist without confusion.
+
+    Painted at logical 16x16 with DPR=2 — same conventions as the
+    other toolbar icons. The polyline traces the flask outline open
+    at the top (between the neck endpoints); the lip is drawn as a
+    separate, slightly-wider horizontal stroke on top of that gap, so
+    the silhouette reads as 'something is poured into here.'"""
+    global _test_icon_cache
+    if _test_icon_cache is not None:
+        return _test_icon_cache
+
+    pix = QPixmap(32, 32)
+    pix.fill(Qt.transparent)
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.Antialiasing)
+
+    color = QColor("#444444")
+    pen = QPen(color)
+    pen.setWidthF(2.4)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.NoBrush)
+
+    # Lip: short horizontal stroke extending past the neck on both
+    # sides, so it reads as a separate "rim" component at small sizes
+    # rather than merging visually into the neck rectangle.
+    painter.drawLine(QPointF(10, 5), QPointF(22, 5))
+
+    # Flask outline, traced clockwise from the upper-left of the neck.
+    # Drawn as an OPEN polyline (not a closed polygon) — the gap at
+    # the top (between 19,5 and 13,5) is where the lip sits, so leaving
+    # it open lets the lip "cap" the shape visually.
+    painter.drawPolyline(QPolygonF([
+        QPointF(13, 5),    # neck upper-left
+        QPointF(13, 10),   # shoulder left (neck → body transition)
+        QPointF(5, 27),    # body bottom-left
+        QPointF(27, 27),   # body bottom-right
+        QPointF(19, 10),   # shoulder right
+        QPointF(19, 5),    # neck upper-right
+    ]))
+
+    # "Liquid" line ~2/3 down the body. The width is computed to match
+    # the body's interior at y=21 (linear interp between the shoulder
+    # at y=10 and the base at y=27 along both diagonals) — so the
+    # endpoints land *on* the outline rather than overflowing it.
+    painter.drawLine(QPointF(8, 21), QPointF(24, 21))
+
+    painter.end()
+    pix.setDevicePixelRatio(2.0)
+
+    _test_icon_cache = QIcon(pix)
+    return _test_icon_cache
+
+
+def _draw_eye_outline(painter: QPainter, color: QColor) -> None:
+    """Shared almond-shaped eye outline + pupil.
+
+    Two cubic Bezier curves form a proper "eye" silhouette pointed at the
+    corners — a plain ellipse would read as an oval, not an eye. The
+    pupil is a small filled circle at the center."""
+    pen = QPen(color)
+    pen.setWidthF(2.0)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.NoBrush)
+
+    path = QPainterPath()
+    # Upper lid: left corner (5, 16) → arch up → right corner (27, 16)
+    path.moveTo(5, 16)
+    path.cubicTo(QPointF(10, 7), QPointF(22, 7), QPointF(27, 16))
+    # Lower lid: right corner → arch down → left corner, closing the shape
+    path.cubicTo(QPointF(22, 25), QPointF(10, 25), QPointF(5, 16))
+    painter.drawPath(path)
+
+    # Pupil — filled circle sized so it reads at small icon scales.
+    painter.setBrush(QBrush(color))
+    painter.setPen(Qt.NoPen)
+    painter.drawEllipse(QPointF(16, 16), 3.0, 3.0)
+
+
+def eye_icon() -> QIcon:
+    """"Currently hidden — click to show" eye icon for password reveal.
+
+    The icon represents the AFFORDANCE (what clicking will do), not the
+    current state — same convention used by GitHub / Windows / iOS
+    password fields. Paired with :func:`eye_slash_icon` for the
+    inverse state."""
+    global _eye_icon_cache
+    if _eye_icon_cache is not None:
+        return _eye_icon_cache
+
+    pix = QPixmap(32, 32)
+    pix.fill(Qt.transparent)
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.Antialiasing)
+    _draw_eye_outline(painter, QColor("#666666"))
+    painter.end()
+    pix.setDevicePixelRatio(2.0)
+
+    _eye_icon_cache = QIcon(pix)
+    return _eye_icon_cache
+
+
+def eye_slash_icon() -> QIcon:
+    """"Currently visible — click to hide" eye icon with diagonal strike.
+
+    Same almond + pupil as :func:`eye_icon`, with a strong diagonal line
+    through the shape. Drawing order: eye first (so the slash overlays
+    cleanly on top), then the slash."""
+    global _eye_slash_icon_cache
+    if _eye_slash_icon_cache is not None:
+        return _eye_slash_icon_cache
+
+    pix = QPixmap(32, 32)
+    pix.fill(Qt.transparent)
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.Antialiasing)
+    color = QColor("#666666")
+    _draw_eye_outline(painter, color)
+
+    # Slash on top. Slightly thicker than the outline so it reads as a
+    # deliberate "cut" rather than another lid line. Round caps mirror
+    # the rest of the icon set.
+    pen = QPen(color)
+    pen.setWidthF(2.6)
+    pen.setCapStyle(Qt.RoundCap)
+    painter.setPen(pen)
+    painter.drawLine(QPointF(7, 7), QPointF(25, 25))
+
+    painter.end()
+    pix.setDevicePixelRatio(2.0)
+
+    _eye_slash_icon_cache = QIcon(pix)
+    return _eye_slash_icon_cache
+
+
+def close_icon() -> QIcon:
+    """Small X glyph for the per-row "close window" affordance on the
+    View menu.
+
+    Two crossed diagonal strokes centered in a 32×32 canvas with DPR=2,
+    matching the rest of the icon set (same stroke weight, same
+    rounded caps, same muted-grey palette). Smaller margin than the
+    other icons because the X needs to fill the visible button area —
+    a 14-px QToolButton renders this at roughly 12 px after padding."""
+    global _close_icon_cache
+    if _close_icon_cache is not None:
+        return _close_icon_cache
+
+    pix = QPixmap(32, 32)
+    pix.fill(Qt.transparent)
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.Antialiasing)
+
+    color = QColor("#444444")
+    pen = QPen(color)
+    pen.setWidthF(2.6)
+    pen.setCapStyle(Qt.RoundCap)
+    painter.setPen(pen)
+    painter.setBrush(Qt.NoBrush)
+
+    margin = 9
+    painter.drawLine(QPointF(margin, margin),
+                     QPointF(32 - margin, 32 - margin))
+    painter.drawLine(QPointF(32 - margin, margin),
+                     QPointF(margin, 32 - margin))
+
+    painter.end()
+    pix.setDevicePixelRatio(2.0)
+
+    _close_icon_cache = QIcon(pix)
+    return _close_icon_cache
