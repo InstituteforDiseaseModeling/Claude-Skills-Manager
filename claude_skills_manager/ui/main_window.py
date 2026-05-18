@@ -1,37 +1,46 @@
-"""Top-level QMainWindow: toolbar + 3-pane splitter + status bar.
+"""Top-level QMainWindow: menus + toolbar + 3-pane splitter + status bar.
 
 Owns the SkillScanner and routes signals between the three panels."""
 from __future__ import annotations
 
 import html
+import logging
 import os
 import sys
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QSettings, QTimer
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtCore import Qt, QSettings, QTimer, QUrl, Signal
+from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QFileDialog, QLabel, QLineEdit, QMainWindow,
-    QMessageBox, QProgressBar, QPushButton, QSizePolicy, QSplitter,
-    QStatusBar, QToolBar, QWidget,
+    QApplication, QCheckBox, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
+    QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QSizePolicy,
+    QSplitter, QStatusBar, QToolBar, QToolButton, QWidget, QWidgetAction,
 )
 
+from ..logging_setup import log_file_path
 from ..models import Skill, SkillType
+from ..recycle import send_to_recycle_bin
 from ..scanner import SkillScanner
 from ..skill_settings import STATE_ON, write_override
-from ._icons import refresh_icon, search_icon
+from ._icons import close_icon, refresh_icon, search_icon
 from ._styles import BUTTON_STYLE
+from .about_dialog import AboutDialog
 from .app_icon import app_icon, app_logo_pixmap, write_logo_ico
 from .win32_taskbar import apply_window_appusermodel
 from .editor_panel import EditorPanel
 from .file_tree import FileTreePanel
 from .image_dialog import ImageDialog
+from .settings_dialog import SettingsDialog
 from .skill_info_panel import SkillInfoPanel
 from .skill_list import (
     STATE_GROUP_DISABLED, STATE_GROUP_ENABLED, SkillListPanel,
 )
+from .check_claude_dialog import CheckClaudeDialog
+from .test_dialog import TestSkillDialog
+
+_logger = logging.getLogger("main_window")
 
 # Logo shown at the leftmost position of the toolbar. 24 logical px is
 # Qt's default toolbar icon footprint — fits inside BUTTON_STYLE's 22px
@@ -60,6 +69,77 @@ _IMAGE_EXTS = frozenset({
 })
 
 
+class _ViewMenuRow(QWidget):
+    """Custom widget rendered inside a QWidgetAction in the View menu.
+
+    Two click zones share one row:
+
+    * **Title label (left)** — clicking anywhere outside the close
+      button raises the corresponding Test Skill window. Handled by
+      ``mousePressEvent`` on the row itself, which only fires when
+      the click lands outside the close button (the button consumes
+      its own clicks first).
+    * **Close button (right)** — a small X tool button that closes
+      the window. Distinct geometry so the user can target it
+      independently of the title.
+
+    Hover styling is restated here because ``QWidgetAction``'s
+    embedded widget doesn't inherit the menu's native hover palette
+    — by default the row looks dead. The selector targets the
+    widget class via ``QWidget#viewMenuRow`` so the rule doesn't
+    cascade to children (especially the QToolButton, which has
+    its own ``autoRaise`` hover behavior)."""
+
+    raise_requested = Signal()
+    close_requested = Signal()
+
+    def __init__(self, title: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("viewMenuRow")
+        # Wider min-width than a typical menu so titles like
+        # "Test Skill — explain-github-workflow" don't elide.
+        self.setMinimumWidth(380)
+        self.setCursor(Qt.PointingHandCursor)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(14, 4, 6, 4)
+        layout.setSpacing(8)
+
+        self._label = QLabel(title)
+        self._label.setStyleSheet("color:#1a1a1a;")
+        self._label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        layout.addWidget(self._label, 1)
+
+        self._close_btn = QToolButton()
+        self._close_btn.setIcon(close_icon())
+        self._close_btn.setAutoRaise(True)
+        self._close_btn.setFixedSize(22, 22)
+        self._close_btn.setCursor(Qt.PointingHandCursor)
+        self._close_btn.setToolTip("Close this Test Skill window")
+        self._close_btn.clicked.connect(self.close_requested)
+        layout.addWidget(self._close_btn)
+
+        # Hover background mimicking a native menu item highlight.
+        # Scoped via objectName so the rule doesn't leak to children;
+        # the close button keeps its own QToolButton:hover style.
+        self.setStyleSheet("""
+            QWidget#viewMenuRow:hover {
+                background: #e8eef9;
+            }
+            QToolButton:hover {
+                background: #d6dff0;
+                border-radius: 3px;
+            }
+        """)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 — Qt naming
+        # Clicks on the close button never reach here — the button
+        # consumes them. So any click that DOES reach us is a click
+        # on the title area, which means "raise."
+        self.raise_requested.emit()
+        super().mousePressEvent(event)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -86,6 +166,19 @@ class MainWindow(QMainWindow):
         # binding only fires on the first show, not on every restore
         # from minimized state.
         self._taskbar_icon_bound = False
+        # Per-skill open test dialogs (§7.34). Indexed by
+        # ``Skill.path`` (the scanner's dedup key) so re-opening the
+        # tester for a skill that already has a window raises the
+        # existing one instead of creating a duplicate. Entries are
+        # removed in ``_on_test_dialog_closed``, which the dialog
+        # emits before destroying itself.
+        self._test_dialogs: dict[Path, TestSkillDialog] = {}
+        # Single-instance health-check dialog (§7.36). Distinct from
+        # ``_test_dialogs`` because there's no per-skill axis — it's
+        # a global "is `claude` working?" check, so one window at a
+        # time is sufficient. Clicking the toolbar button a second
+        # time raises the existing window instead of opening a duplicate.
+        self._check_claude_dialog: CheckClaudeDialog | None = None
 
         self._build_ui()
         self._connect_signals()
@@ -144,6 +237,7 @@ class MainWindow(QMainWindow):
         self.skill_info = SkillInfoPanel()
         self.editor_panel = EditorPanel()
 
+        self._build_menus()
         self.addToolBar(Qt.TopToolBarArea, self._build_toolbar())
 
         # Middle column is itself a vertical split: file tree on top, SKILL.md
@@ -218,6 +312,12 @@ class MainWindow(QMainWindow):
         self.refresh_btn.setStyleSheet(BUTTON_STYLE)
         self.refresh_btn.setShortcut(QKeySequence.Refresh)  # F5
         self.refresh_btn.clicked.connect(self.refresh)
+        # NOTE: "Test Skill…" and "Check Claude" buttons were intentionally
+        # removed from the toolbar. The per-skill test runner lives in the
+        # right-click context menu only; the CLI health check moved to
+        # Help → Test Claude connection. Goal: keep `claude`-specific
+        # affordances off the main toolbar so the surface stays focused on
+        # browsing/editing.
 
         self.cb_global  = QCheckBox("Global")
         self.cb_project = QCheckBox("Project")
@@ -293,6 +393,13 @@ class MainWindow(QMainWindow):
     def _connect_signals(self) -> None:
         self.skill_list.skill_selected.connect(self.on_skill_selected)
         self.skill_list.state_change_requested.connect(self._on_state_change_requested)
+        # Context-menu "Test Skill…" → same entry point as the toolbar
+        # button. The skill_list emits with a Skill, not the current
+        # selection, so the user can right-click a different row than
+        # whatever's selected and still test it directly.
+        self.skill_list.test_skill_requested.connect(self.open_test_dialog)
+        self.skill_list.delete_skill_requested.connect(
+            self._on_delete_skill_requested)
         self.skill_info.state_change_requested.connect(self._on_state_change_requested)
         self.file_tree.file_activated.connect(self.on_file_activated)
         self.editor_panel.file_saved.connect(self._on_file_saved)
@@ -415,12 +522,269 @@ class MainWindow(QMainWindow):
 
     def on_skill_selected(self, skill: Skill) -> None:
         if not self.editor_panel.confirm_close():
+            # User cancelled the unsaved-changes prompt. The skill list's
+            # visual selection has already moved to ``skill`` (Qt updates
+            # the highlight synchronously, before _on_selection fires) —
+            # restore it to whatever skill the editor is *actually*
+            # showing, so the highlight matches the editor content. Same
+            # pattern as on_file_activated for the file tree (§7.27): on
+            # rejection, snap the view back to ground truth. If no skill
+            # was previously selected, drop the highlight entirely rather
+            # than leave it pinned to the rejected target.
+            if self._current_skill is not None:
+                if not self.skill_list.select_skill(self._current_skill):
+                    self.skill_list.clear_selection()
+            else:
+                self.skill_list.clear_selection()
             return
         self._current_skill = skill
         self.file_tree.show_directory(skill.path)
         self.skill_info.show_skill(skill)
         self.editor_panel.show_skill(skill)
         self.statusBar().showMessage(f"{skill.type.value} • {skill.path}")
+
+    def open_test_dialog(self, skill: Skill) -> None:
+        """Open (or re-focus) the modeless test dialog for ``skill``.
+
+        Per-skill instance via ``_test_dialogs`` map keyed on the
+        absolute path: opening the dialog twice for the same skill
+        raises the existing window rather than spawning a duplicate.
+        Opening it for *different* skills creates parallel dialogs —
+        user spec was "one per skill, multiple skills OK".
+
+        The dialog manages its own lifetime
+        (``WA_DeleteOnClose``); we only need to clear our map entry
+        when it closes, which the ``closed`` signal handles."""
+        existing = self._test_dialogs.get(skill.path)
+        if existing is not None:
+            # Route through _raise_dialog so the minimized-restore
+            # idiom (clear WindowMinimized bit, then show + raise +
+            # activate) lives in one place instead of being duplicated
+            # at every "re-open" site.
+            self._raise_dialog(existing)
+            return
+        dialog = TestSkillDialog(skill, parent=self)
+        dialog.closed.connect(self._on_test_dialog_closed)
+        self._test_dialogs[skill.path] = dialog
+        dialog.show()
+        self._rebuild_view_menu()
+
+    def _on_test_dialog_closed(self, skill_path) -> None:
+        """``TestSkillDialog.closed`` slot — drop the entry from the
+        registry. The dialog itself is destroyed by Qt right after
+        emitting this signal (``WA_DeleteOnClose`` triggers
+        ``deleteLater`` from inside ``closeEvent``).
+
+        ``skill_path`` arrives as ``object`` because Qt doesn't have a
+        built-in registration for ``pathlib.Path`` signals; we coerce
+        to ``Path`` only for the dict lookup."""
+        self._test_dialogs.pop(Path(skill_path), None)
+        self._rebuild_view_menu()
+
+    def open_check_claude_dialog(self) -> None:
+        """Open (or re-focus) the singleton health-check dialog (§7.36).
+        Triggered from Help → Test Claude connection.
+
+        Same raise-existing-or-create pattern as ``open_test_dialog``
+        but without the per-skill axis — there's only one ``claude``
+        install to test, so one dialog suffices."""
+        if self._check_claude_dialog is not None:
+            # Same restore-from-minimized handling as
+            # open_test_dialog — kept centralized in _raise_dialog.
+            self._raise_dialog(self._check_claude_dialog)
+            return
+        dlg = CheckClaudeDialog(parent=self)
+        dlg.closed.connect(self._on_check_claude_dialog_closed)
+        self._check_claude_dialog = dlg
+        dlg.show()
+
+    def _on_check_claude_dialog_closed(self) -> None:
+        """Clear the registry slot when the dialog closes so the next
+        click constructs a fresh instance (and re-runs the auto-test).
+        Mirrors ``_on_test_dialog_closed`` for the per-skill case."""
+        self._check_claude_dialog = None
+
+    # ----------------------------------------------------------- menu bar
+    def _build_menus(self) -> None:
+        """Wire the menu bar: File / Help / View.
+
+        Action shortcuts coexist with toolbar shortcuts via
+        ``ApplicationShortcut`` context where useful. ``QAction`` with
+        a shortcut auto-renders the chord in the menu's right gutter."""
+        menubar = self.menuBar()
+
+        # ---- File ----
+        file_menu = menubar.addMenu("&File")
+        act_refresh = QAction("&Refresh skills", self)
+        act_refresh.setShortcut(QKeySequence.Refresh)  # F5
+        act_refresh.triggered.connect(self.refresh)
+        file_menu.addAction(act_refresh)
+        file_menu.addSeparator()
+        act_quit = QAction("&Quit", self)
+        act_quit.setShortcut(QKeySequence("Ctrl+Q"))
+        act_quit.triggered.connect(self.close)
+        file_menu.addAction(act_quit)
+
+        # ---- View ----
+        # Populated lazily from ``_test_dialogs`` via
+        # ``_rebuild_view_menu``. Kept on ``self`` because we mutate
+        # it on every dialog open / close. Constructed BEFORE Help so
+        # the menu bar order is File / View / Help.
+        self._view_menu = menubar.addMenu("&View")
+        self._view_menu.aboutToShow.connect(self._rebuild_view_menu)
+        self._rebuild_view_menu()
+
+        # ---- Help ----
+        help_menu = menubar.addMenu("&Help")
+        act_check = QAction("&Test Claude connection", self)
+        act_check.setShortcut(QKeySequence("Ctrl+T"))
+        act_check.triggered.connect(self.open_check_claude_dialog)
+        help_menu.addAction(act_check)
+        act_open_logs = QAction("&Open log folder", self)
+        act_open_logs.triggered.connect(self._open_log_folder)
+        help_menu.addAction(act_open_logs)
+        act_settings = QAction("&Settings…", self)
+        act_settings.triggered.connect(self._open_settings_dialog)
+        help_menu.addAction(act_settings)
+        help_menu.addSeparator()
+        act_about = QAction("&About", self)
+        act_about.triggered.connect(self._open_about_dialog)
+        help_menu.addAction(act_about)
+
+    def _rebuild_view_menu(self) -> None:
+        """Re-populate the View menu from the live ``_test_dialogs``
+        map. Cheap (the map is small); called from every site that
+        adds or removes an entry, plus ``aboutToShow`` as a backstop
+        in case any path forgot to invalidate.
+
+        Each row is a custom ``_ViewMenuRow`` widget wrapped in a
+        ``QWidgetAction`` so the row can host two click zones: the
+        title area (raises the window) and a close X button (closes
+        it). The placeholder for the empty state stays a plain
+        QAction — no per-row affordances to surface there."""
+        if not hasattr(self, "_view_menu"):
+            return
+        self._view_menu.clear()
+        # Sort by window title so the menu order is stable and
+        # readable (alphabetical by skill name).
+        entries = sorted(
+            self._test_dialogs.items(),
+            key=lambda kv: kv[1].windowTitle().lower(),
+        )
+        if not entries:
+            placeholder = QAction(
+                "(no open Skill Test windows)", self._view_menu)
+            placeholder.setEnabled(False)
+            self._view_menu.addAction(placeholder)
+            return
+        # Bulk "Close All" affordance at the top of the menu — hidden
+        # when there's nothing open. Plain QAction (not a custom
+        # _ViewMenuRow) so the visual hierarchy makes the bulk op
+        # distinct from the per-dialog rows below. Italicized label
+        # via QAction.setFont is overkill — the separator already
+        # signals the boundary.
+        act_close_all = QAction(
+            f"Close All ({len(entries)})", self._view_menu)
+        act_close_all.setToolTip(
+            "Close every open Skill Test window. Each dialog's own "
+            "cancel-on-close logic runs (in-flight `claude` runs are "
+            "killed); no test data is persisted across closes.")
+        act_close_all.triggered.connect(self._close_all_test_dialogs)
+        self._view_menu.addAction(act_close_all)
+        self._view_menu.addSeparator()
+        for _, dialog in entries:
+            row = _ViewMenuRow(dialog.windowTitle())
+            # Default-argument captures the dialog by value at
+            # connection time, sidestepping Python's late-binding
+            # closure semantics in the for-loop.
+            row.raise_requested.connect(
+                lambda d=dialog: self._raise_dialog_from_menu(d))
+            row.close_requested.connect(
+                lambda d=dialog: self._close_dialog_from_menu(d))
+
+            action = QWidgetAction(self._view_menu)
+            action.setDefaultWidget(row)
+            self._view_menu.addAction(action)
+
+    def _raise_dialog_from_menu(self, dialog) -> None:
+        """Raise the dialog AND dismiss the menu. QWidgetAction
+        widgets don't auto-close their parent menu on click, so we
+        close it explicitly — otherwise the menu lingers above the
+        window the user just asked to see."""
+        self._view_menu.close()
+        self._raise_dialog(dialog)
+
+    def _close_all_test_dialogs(self) -> None:
+        """Close every open Test Skill dialog. Triggered from the
+        View menu's "Close All" entry.
+
+        Snapshot the values list before iterating — each
+        ``dialog.close()`` triggers ``WA_DeleteOnClose`` →
+        ``closed`` signal → ``_on_test_dialog_closed`` → pops the
+        entry from ``self._test_dialogs`` and rebuilds the menu.
+        Iterating the live dict here would raise
+        ``RuntimeError: dictionary changed size during iteration``.
+
+        No confirmation: each dialog's own ``closeEvent`` already
+        cancels in-flight ``claude`` runs and tears down gracefully,
+        and there's no persistent state to lose (Continue-conversation
+        session ids live on disk in Claude's own state, not in the
+        dialog). The bulk gesture maps 1:1 onto clicking X on each
+        dialog individually."""
+        self._view_menu.close()
+        for dialog in list(self._test_dialogs.values()):
+            dialog.close()
+
+    def _close_dialog_from_menu(self, dialog) -> None:
+        """Close the dialog AND dismiss the menu. ``dialog.close()``
+        triggers ``WA_DeleteOnClose`` → emits ``closed`` →
+        ``_on_test_dialog_closed`` → ``_rebuild_view_menu``, so the
+        row will be gone the next time the user opens View. No
+        manual map maintenance needed here."""
+        self._view_menu.close()
+        dialog.close()
+
+    @staticmethod
+    def _raise_dialog(dialog) -> None:
+        """Bring a child dialog forward — restoring it from a minimized
+        state if necessary.
+
+        ``show()`` and ``raise_()`` alone don't restore a minimized
+        window on Windows: a minimized window is still ``isVisible()``,
+        and the minimized state lives in ``windowState()`` rather than
+        the visibility flag. To un-minimize we clear the
+        ``WindowMinimized`` bit explicitly. Bit-mask manipulation
+        (rather than ``showNormal()``) preserves any
+        ``WindowMaximized`` bit, so a minimize-from-maximized restores
+        back to maximized — matching the OS taskbar's behaviour.
+        ``WindowActive`` is OR-ed in to cue the WM to give the window
+        focus on restore."""
+        dialog.setWindowState(
+            (dialog.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _open_settings_dialog(self) -> None:
+        SettingsDialog(self).exec()
+
+    def _open_about_dialog(self) -> None:
+        AboutDialog(self).exec()
+
+    def _open_log_folder(self) -> None:
+        """Reveal the directory containing the log file. Uses
+        ``QDesktopServices.openUrl`` so the OS opens its native file
+        manager (Explorer on Windows, Finder on macOS, default file
+        manager on Linux) — much friendlier than spawning a Shell
+        process directly."""
+        log_path = log_file_path()
+        target = log_path.parent
+        opened = QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+        if not opened:
+            QMessageBox.information(
+                self, "Open log folder",
+                f"Log file: {log_path}\n\nCouldn't open the folder "
+                f"automatically. The path above is the location.")
 
     def on_file_activated(self, path: Path) -> None:
         # Image files open in a dedicated modal viewer — Editor tab can't
@@ -478,6 +842,95 @@ class MainWindow(QMainWindow):
             self.skill_info.show_skill(skill)
         word = "Enabled" if new_state == STATE_ON else "Disabled"
         self.statusBar().showMessage(f"{word} {skill.name}", 4000)
+
+    def _on_delete_skill_requested(self, skill: Skill) -> None:
+        """Two-step confirmation, then soft-delete the skill folder to
+        the OS Recycle Bin and trigger a rescan.
+
+        Plugin skills are rejected defensively (the menu hides the
+        entry, but a future code path that emits the signal directly
+        shouldn't be able to slip a plugin delete through). The two
+        dialogs are deliberately different in tone:
+
+        * The first is a standard Question with Yes/No — fast to dismiss
+          if the user mis-clicked.
+        * The second is a Warning with explicit verb-noun buttons
+          ("Move to Recycle Bin" / "Cancel"), default Cancel — a small
+          guard against muscle-memory double-Yes.
+
+        Both have ``No`` / ``Cancel`` as the default button so the safe
+        outcome happens if the user hits Enter without reading."""
+        if skill.type == SkillType.PLUGIN:
+            # Should never reach here (menu hides the entry), but a
+            # signal-level guard is cheap and defends against a future
+            # caller wiring the signal up differently.
+            QMessageBox.warning(
+                self, "Cannot delete",
+                "Plugin skills can't be deleted from this GUI — uninstall "
+                "the plugin via /plugin in Claude Code.")
+            return
+
+        # File count is informational — gives the user a sense of how
+        # much is about to move. rglob is cheap for a skill folder
+        # (typically tens of files, not thousands).
+        try:
+            file_count = sum(1 for _ in skill.path.rglob("*") if _.is_file())
+        except OSError:
+            file_count = -1  # unknown — don't block the flow on a stat error
+        files_blurb = (
+            f"{file_count} file{'s' if file_count != 1 else ''}"
+            if file_count >= 0 else "the folder contents")
+
+        # ----- Confirmation 1: standard Yes/No -----
+        first = QMessageBox.question(
+            self,
+            "Delete skill?",
+            f"Move skill <b>{skill.name}</b> to the Recycle Bin?<br><br>"
+            f"<span style='color:#555;'>Location:</span> "
+            f"<code>{skill.path}</code><br>"
+            f"<span style='color:#555;'>Contents:</span> {files_blurb}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if first != QMessageBox.Yes:
+            return
+
+        # ----- Confirmation 2: Warning, verb-noun buttons -----
+        second = QMessageBox(self)
+        second.setIcon(QMessageBox.Warning)
+        second.setWindowTitle("Are you sure?")
+        second.setText(
+            f"This will move <b>{skill.name}</b> ({files_blurb}) "
+            "to the Recycle Bin.")
+        second.setInformativeText(
+            "You can restore the skill from the Recycle Bin until "
+            "you empty it.")
+        recycle_btn = second.addButton(
+            "Move to Recycle Bin", QMessageBox.AcceptRole)
+        cancel_btn = second.addButton(
+            "Cancel", QMessageBox.RejectRole)
+        second.setDefaultButton(cancel_btn)
+        second.exec()
+        if second.clickedButton() is not recycle_btn:
+            return
+
+        # ----- Execute -----
+        try:
+            send_to_recycle_bin(skill.path)
+        except (OSError, FileNotFoundError,
+                NotImplementedError) as exc:
+            QMessageBox.critical(
+                self, "Couldn't delete skill",
+                f"Failed to move <b>{skill.name}</b> to the Recycle Bin:"
+                f"<br><br><code>{exc}</code>")
+            return
+
+        self.statusBar().showMessage(
+            f"Moved {skill.name} to Recycle Bin", 4000)
+        # Full refresh — the path is gone, so any panel still pointing
+        # at it (file tree, editor buffer, skill info) gets cleared by
+        # MainWindow.refresh()'s per-panel clear() orchestration.
+        self.refresh()
 
     def _scope_dir_for(self, skill: Skill) -> Path | None:
         """Return the .claude directory whose settings.local.json controls

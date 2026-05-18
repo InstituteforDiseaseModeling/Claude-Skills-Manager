@@ -40,7 +40,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..models import Skill
-from ..skill_md import estimated_token_count, parse_skill_md_text
+from ..skill_md import estimated_token_count, parse_skill_md_text, strip_frontmatter
 from ._styles import BUTTON_STYLE
 from .code_editor import CodeEditor
 from .syntax import highlighter_for_extension
@@ -298,7 +298,7 @@ class EditorPanel(QWidget):
         Strips a leading YAML frontmatter block (same as Description) so the
         rendered prose body is what actually shows up."""
         text = self.editor.toPlainText()
-        self.md_preview.setMarkdown(_strip_frontmatter(text).strip())
+        self.md_preview.setMarkdown(strip_frontmatter(text).strip())
 
     def _render_description(self) -> None:
         skill = self._current_skill
@@ -317,7 +317,7 @@ class EditorPanel(QWidget):
         else:
             name, description = skill.name, skill.description
 
-        body = _strip_frontmatter(raw).strip() if raw else ""
+        body = strip_frontmatter(raw).strip() if raw else ""
         parts: list[str] = [f"# {name}"]
         if description:
             parts.append(f"> {description}")
@@ -411,45 +411,3 @@ QTabBar::tab:selected {
 """
 
 
-def _strip_frontmatter(md: str) -> str:
-    """Drop a leading YAML frontmatter block — and any orphan bare ``---``
-    lines that immediately follow it — so the rendered preview shows only
-    the prose body.
-
-    The "and orphan ``---`` lines" tail is load-bearing. Some SKILL.md
-    files in the wild ship with a *doubled* terminator (``---\\nyaml\\n
-    ---\\n---``) — an authoring slip where the writer typed three dashes
-    twice at the end of the frontmatter. The code-review skill in the
-    ``idm-agent-skills`` marketplace is one such file. Without eating the
-    orphan, Qt's CommonMark parser reads the leftover ``---`` as the
-    *opener* of a new YAML block and scans ahead for a closer. It finds
-    one inside a ``` ```markdown ``` example block further down the file
-    and hides every line in between — most of the document.
-
-    See §7.28 for the parser-composition failure mode this guards
-    against. The loop also gracefully handles a third or fourth
-    terminator if anyone manages to triple-tap; bare ``---`` lines are
-    horizontal rules either way, but stripping them at the head keeps
-    the rendered output starting with a real heading."""
-    if not md.startswith("---"):
-        return md
-    end = md.find("\n---", 3)
-    if end == -1:
-        return md
-    next_newline = md.find("\n", end + 4)
-    if next_newline == -1:
-        return ""
-    body = md[next_newline + 1:]
-    # Eat any bare "---" lines that follow the frontmatter close
-    # (blanks between them are fine — we just want to skip ahead to the
-    # first non-"---" line of actual content).
-    while True:
-        peeked = body.lstrip("\r\n")
-        line_end = peeked.find("\n")
-        line = peeked if line_end == -1 else peeked[:line_end]
-        if line.rstrip("\r").strip() != "---":
-            break
-        if line_end == -1:
-            return ""
-        body = peeked[line_end + 1:]
-    return body

@@ -1,44 +1,19 @@
 # Claude Skills Manager
 
-A desktop GUI for discovering, browsing, and editing **Claude Code skills**
-on your machine. Three-pane layout: skill list → file tree → editor with
-live markdown preview.
+A Python desktop GUI for browsing, editing, enabling/disabling, and
+testing **Claude Code skills** from the three on-disk sources Claude
+Code itself consults:
 
-Built with PySide6. Runs on Windows, macOS, and Linux.
+| Source  | Location |
+|---------|----------|
+| Global  | `~/.claude/skills/<skill>/SKILL.md` |
+| Plugin  | `~/.claude/plugins/marketplaces/<m>/.../<plugin>/skills/<skill>/SKILL.md` |
+| Project | `<project-root>/**/.claude/skills/<skill>/SKILL.md` |
 
----
+Built with PySide6. Cross-platform in principle; primary development
+target is Windows.
 
-## Why
-
-Claude Code skills live in three places on disk, and there's no single
-place to see what you have, what's enabled, or what's inside each one:
-
-| Source      | Location                                                              |
-| ----------- | --------------------------------------------------------------------- |
-| **Global**  | `~/.claude/skills/`                                                   |
-| **Plugin**  | `~/.claude/plugins/marketplaces/*/plugins/*/skills/`                  |
-| **Project** | `<your-project>/**/.claude/skills/` (recursive)                       |
-
-This app scans all three, groups them by source, and lets you read or edit
-the `SKILL.md` (and its supporting files) without leaving the window.
-
-## Features
-
-- **Three-source discovery** — Global, Plugin, and Project skills in one list.
-- **Filter by source and state** — toggle Global/Project/Plugin, Enabled/Disabled.
-- **Search** — quick filter by skill name or description.
-- **Markdown preview** — `SKILL.md` rendered with frontmatter stripped.
-- **In-app editor** — `QPlainTextEdit` with line numbers and lightweight syntax
-  highlighting for `.py`, `.json`, and `.md`. Content-based dirty detection
-  (no false positives from re-highlighting).
-- **Skill metadata panel** — size, modification time, and an approximate
-  token count for the selected `SKILL.md`.
-- **Enable / Disable** project skills via `skillOverrides` in
-  `.claude/settings.json`.
-- **Persistent layout** — window geometry, splitter positions, project root,
-  and filter checkboxes are saved between runs (`QSettings`).
-
-## Install & run
+## Run
 
 ```powershell
 python -m venv .venv
@@ -47,78 +22,85 @@ pip install -r requirements.txt
 python main.py
 ```
 
-On macOS / Linux, activate the venv with `source .venv/bin/activate`.
+Requires Python 3.10+ (uses `from __future__ import annotations`, PEP
+604 union syntax, and `Path.is_relative_to`).
 
-### Install as a package
+Dependencies are deliberately minimal — `PySide6` (Qt bindings, LGPL)
+and `PyYAML` for frontmatter parsing.
 
-`pyproject.toml` is configured so you can install the app and get a
-GUI launcher shim:
+## What it does
 
-```powershell
-pip install .
-claude-skills-manager
-```
-
-Requires Python 3.10 or newer.
-
-## How to use
-
-1. **Choose a project root** from the toolbar if you want Project skills to
-   appear. Global and Plugin skills load automatically.
-2. **Click a skill** in the left panel — the middle panel roots its file
-   tree to that skill, and the right panel switches to the **Description**
-   tab with the rendered `SKILL.md`.
-3. **Click a file** in the middle tree — the right panel's **Editor** tab
-   loads it. Image files (`.png`, `.jpg`, …) open in a separate viewer.
-4. **Edit, Save, Revert** — the title bar dot (●) indicates unsaved changes.
-5. **Enable / Disable** a project skill from the metadata panel below the
-   file tree.
-
-## Architecture
-
-Three-pane PySide6 desktop app. `MainWindow` owns the only `SkillScanner`
-and routes Qt signals between the three panels — panels never reach into
-each other directly. Domain modules (`models.py`, `scanner.py`,
-`skill_md.py`) are kept **Qt-free** so they're unit-testable from a plain
-script.
+Three-pane layout:
 
 ```
-main.py
+┌────────────────┬──────────────────────┬──────────────────────────────────┐
+│ Skill list     │ File tree            │ Description / Editor / Preview   │
+│                │                      │                                  │
+│ Global (N)     │ ▼ skill-name/        │ Renders SKILL.md as markdown;    │
+│ Project (N)    │    SKILL.md          │ opens any clicked file in an     │
+│ Plugin  (N)    │    scripts/run.py    │ editor with .py / .json / .md    │
+│                │    README.md         │ syntax highlighting. Images      │
+│                │                      │ open in a zoom/pan viewer.       │
+└────────────────┴──────────────────────┴──────────────────────────────────┘
+```
+
+- **Discovery.** Scans all three sources on startup and on **Refresh**.
+  The Project scan is depth-limited (`MAX_SCAN_DEPTH = 8`) and skips
+  the usual vendored/build directories — pointing it at `C:\` will not
+  hang.
+- **Filter & search.** Toolbar checkboxes filter by type (Global /
+  Project / Plugin) and state (Enabled / Disabled); the search box
+  does a live name-substring filter on top.
+- **Enable / Disable.** Right-click a Global or Project skill row →
+  toggles `skillOverrides[<name>] = "off"` in the scope's
+  `.claude/settings.local.json`. Plugin-skill enablement is read-only
+  in the GUI; use `/plugin` in Claude Code itself.
+- **Editor.** `Ctrl+S` saves. Dirty state is content-based: typing a
+  file back to its original contents un-dirties the buffer.
+- **Test Skill (`Ctrl+T`).** Modeless per-skill dialog that shells out
+  to `claude -p` and streams the response. Has a **Working Directory**
+  field (the project context Claude runs in) and a **Trust Directory**
+  field (emitted as `--add-dir` so Claude can read the selected skill
+  even when it lives outside the working directory — e.g. a Global or
+  Plugin skill).
+- **Persistence.** Project root, filter checkboxes, window geometry,
+  and splitter state survive across launches via `QSettings`.
+
+## Layout
+
+```
+Claude_Skills_Manager_GUI/
+├── main.py                     entry point
+├── requirements.txt
+├── CLAUDE.md                   guidance for Claude Code working in this repo
+├── DESIGN.md                   architecture, decisions, iteration log
 └── claude_skills_manager/
-    ├── models.py          Skill, SkillType         (Qt-free)
-    ├── scanner.py         3-source discovery       (Qt-free)
-    ├── skill_md.py        SKILL.md parser          (Qt-free)
-    ├── skill_settings.py  skillOverrides r/w       (Qt-free)
-    └── ui/
-        ├── main_window.py     toolbar + signal routing
-        ├── skill_list.py      left panel
-        ├── file_tree.py       middle panel
-        ├── skill_info_panel.py metadata + Enable/Disable
-        ├── editor_panel.py    Description / Editor tabs
-        ├── code_editor.py     QPlainTextEdit + line numbers
-        ├── syntax.py          .py / .json / .md highlighters
-        └── …
+    ├── models.py               Skill, SkillType (Qt-free)
+    ├── scanner.py              three-source discovery + state pass
+    ├── skill_md.py             frontmatter parser + token estimator
+    ├── skill_settings.py       skillOverrides + enabledPlugins read/write
+    ├── skill_introspect.py     examples extraction + `claude -p` argv builder
+    ├── claude_trust.py         ~/.claude.json trust-folder writer
+    └── ui/                     PySide6 widgets (QTreeWidget, editor, dialogs)
 ```
 
-See [`DESIGN.md`](DESIGN.md) for the full architectural rationale, the
-three-source discovery model, the iteration log of bugs and fixes, and the
-non-obvious Qt conventions (named enums, content-based dirty, lazy
-`QFileSystemModel` attachment, …).
+**Layering rule.** `models.py`, `scanner.py`, `skill_md.py`,
+`skill_settings.py`, `skill_introspect.py`, and `claude_trust.py` are
+Qt-free. The UI depends on them; not the reverse. See `CLAUDE.md` for
+the full list of invariants worth preserving.
 
-For agent / AI-assistant guidance when working in this repo, see
-[`CLAUDE.md`](CLAUDE.md).
+## Tests, CI, etc.
 
-## Development notes
+There is no test suite, linter, formatter, or build step in this
+repository. The lightweight validation gate is `python -c "import ast;
+ast.parse(open('<file>', encoding='utf-8').read())"` for any file
+that's been edited. End-to-end verification is by launching the GUI.
 
-- **No test suite, linter, or formatter** — by design, to keep the surface
-  small. Quick syntax validation: `python -c "import ast; ast.parse(open('<file>', encoding='utf-8').read())"`.
-- **End-to-end verification is by launching the GUI.**
-- **Dependencies are deliberately minimal** — PySide6 (LGPL) and PyYAML.
-  No external markdown library (`QTextBrowser.setMarkdown()` handles it).
-  No external syntax-highlighting library (hand-rolled `QSyntaxHighlighter`).
-- **Layering rule** — `models.py`, `scanner.py`, `skill_md.py` must remain
-  Qt-free. UI depends on domain, never the reverse.
+## More
 
-## License
-
-MIT.
+- `DESIGN.md` — the canonical reference. Architecture, technology
+  choices, the three-source discovery model, and a numbered iteration
+  log of every bug encountered and how it was fixed. Read this before
+  making non-trivial changes.
+- `CLAUDE.md` — guidance for Claude Code when working in this repo;
+  short orientation plus a list of load-bearing conventions.

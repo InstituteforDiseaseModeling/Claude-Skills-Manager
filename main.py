@@ -6,6 +6,7 @@ import sys
 from PySide6.QtCore import QtMsgType, qInstallMessageHandler
 from PySide6.QtWidgets import QApplication
 
+from claude_skills_manager.logging_setup import configure_logging, log_qt_message
 from claude_skills_manager.ui.app_icon import app_icon
 from claude_skills_manager.ui.main_window import MainWindow
 
@@ -21,9 +22,19 @@ from claude_skills_manager.ui.main_window import MainWindow
 _WINDOWS_APP_ID = "ClaudeSkillsManager.ClaudeSkillsManager"
 
 
+_QT_SEVERITY = {
+    QtMsgType.QtDebugMsg:    "debug",
+    QtMsgType.QtInfoMsg:     "info",
+    QtMsgType.QtWarningMsg:  "warning",
+    QtMsgType.QtCriticalMsg: "critical",
+    QtMsgType.QtFatalMsg:    "fatal",
+}
+
+
 def _qt_message_handler(mode, context, message: str) -> None:
     """Custom Qt logging handler that filters one specific cosmetic
-    warning while passing everything else through to stderr.
+    warning while routing everything else through Python ``logging`` →
+    the configured log file.
 
     The filtered pattern is Qt's Windows QPA screen backend logging
     SetupAPI failures (``CR_NO_SUCH_VALUE`` / ``0xe0000225``) when it
@@ -32,13 +43,7 @@ def _qt_message_handler(mode, context, message: str) -> None:
     refresh rate transitions, and multi-monitor setups where one
     display's EDID is incomplete. Qt falls back to defaults internally
     and the app continues to function; the message is purely a log
-    artifact. See §7.31 for the full diagnosis.
-
-    Everything else (other warnings, info, debug, critical, fatal) is
-    forwarded to stderr with the category prefix so real Qt-side
-    issues still surface. The category prefix mimics Qt's default
-    formatter so the console output stays consistent for unfiltered
-    messages."""
+    artifact. See §7.31 for the full diagnosis."""
     if mode == QtMsgType.QtWarningMsg and \
             "Unable to open monitor interface" in message:
         return
@@ -46,8 +51,8 @@ def _qt_message_handler(mode, context, message: str) -> None:
         category = (context.category or "").strip()
     except (AttributeError, TypeError):
         category = ""
-    prefix = f"{category}: " if category else ""
-    sys.stderr.write(f"{prefix}{message}\n")
+    severity = _QT_SEVERITY.get(mode, "warning")
+    log_qt_message(category, message, severity)
 
 
 def _set_windows_taskbar_identity() -> None:
@@ -71,6 +76,11 @@ def _set_windows_taskbar_identity() -> None:
 
 
 def main() -> int:
+    # File logging FIRST — every diagnostic from here on (including the
+    # Qt warnings routed through `_qt_message_handler`) lands in the
+    # same per-launch log file. Truncation means a "launch, repro, send
+    # the log" flow gives a clean trace per bug report.
+    configure_logging()
     # Install the Qt logging filter before anything else so even very
     # early Qt warnings (e.g., during QApplication construction) are
     # routed through our handler.

@@ -59,6 +59,57 @@ def _naive_parse(block: str) -> dict:
     return out
 
 
+def strip_frontmatter(md: str) -> str:
+    """Drop a leading YAML frontmatter block — and any orphan bare ``---``
+    lines that immediately follow it — so the rendered preview shows
+    only the prose body.
+
+    The "and orphan ``---`` lines" tail is load-bearing. Some
+    SKILL.md files in the wild ship with a *doubled* terminator
+    (``---\\nyaml\\n---\\n---``) — an authoring slip where the writer
+    typed three dashes twice at the end of the frontmatter. The
+    ``code-review`` skill in the ``idm-agent-skills`` marketplace is
+    one such file. Without eating the orphan, Qt's CommonMark parser
+    reads the leftover ``---`` as the *opener* of a new YAML block and
+    scans ahead for a closer — finding one inside a triple-backtick
+    code block further down the file, which hides every line in
+    between (most of the document). See §7.28 for the parser-composition
+    failure mode this guards against.
+
+    The loop also handles a third or fourth terminator gracefully if
+    anyone manages to triple-tap; bare ``---`` lines render as
+    horizontal rules either way, but stripping them at the head keeps
+    the rendered output starting with a real heading.
+
+    Lives in :mod:`skill_md` (rather than the previous home in
+    ``editor_panel``) so both the editor panel's Preview tab and the
+    test dialog's Description tab share one implementation — the
+    §7.28 defense is a meaningful behavior, not boilerplate to
+    duplicate."""
+    if not md.startswith("---"):
+        return md
+    end = md.find("\n---", 3)
+    if end == -1:
+        return md
+    next_newline = md.find("\n", end + 4)
+    if next_newline == -1:
+        return ""
+    body = md[next_newline + 1:]
+    # Eat any bare "---" lines that follow the frontmatter close
+    # (blanks between them are fine — we just want to skip ahead to the
+    # first non-"---" line of actual content).
+    while True:
+        peeked = body.lstrip("\r\n")
+        line_end = peeked.find("\n")
+        line = peeked if line_end == -1 else peeked[:line_end]
+        if line.rstrip("\r").strip() != "---":
+            break
+        if line_end == -1:
+            return ""
+        body = peeked[line_end + 1:]
+    return body
+
+
 def estimated_token_count(text: str, *, chars_per_token: int = 4) -> int:
     """Rough token-count estimate (chars / ``chars_per_token``, rounded up).
 

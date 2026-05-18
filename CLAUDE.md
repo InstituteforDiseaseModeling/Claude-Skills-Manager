@@ -27,7 +27,7 @@ Three-pane PySide6 desktop app: skill list (left) → file tree (middle) → edi
 
 ## Layering rule (load-bearing)
 
-`claude_skills_manager/models.py`, `scanner.py`, and `skill_md.py` **must remain Qt-free**. They are imported from a plain Python script and form the unit-testable seam. UI code (`ui/*.py`) depends on the domain modules; the reverse direction is forbidden.
+`claude_skills_manager/models.py`, `scanner.py`, `skill_md.py`, and `claude_trust.py` **must remain Qt-free**. They are imported from a plain Python script and form the unit-testable seam. UI code (`ui/*.py`) depends on the domain modules; the reverse direction is forbidden.
 
 ## Conventions worth preserving
 

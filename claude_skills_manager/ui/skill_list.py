@@ -374,6 +374,18 @@ class SkillListPanel(QWidget):
     # Emitted when user picks Enable/Disable from the right-click menu.
     # MainWindow handles the actual settings write and panel refresh.
     state_change_requested = Signal(object, str)  # (Skill, "on" | "off")
+    # Emitted when user picks "Test Skill…" from the right-click menu
+    # (§7.34). Same target as the toolbar's Test button, but the menu
+    # entry operates on the skill *under the cursor* — not the currently
+    # selected one — so the user can open a tester for a different skill
+    # without disrupting their current selection.
+    test_skill_requested = Signal(object)  # emits Skill
+    # Emitted when user picks "Delete Skill…" from the right-click menu.
+    # Only emitted for Global/Project skills — the menu entry is hidden
+    # entirely for Plugin skills (which the user manages via /plugin).
+    # MainWindow performs the double confirmation, then soft-deletes the
+    # skill folder to the OS Recycle Bin and triggers a rescan.
+    delete_skill_requested = Signal(object)  # emits Skill
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -448,6 +460,39 @@ class SkillListPanel(QWidget):
         try:
             self.tree.clearSelection()
             self.tree.setCurrentItem(None)
+        finally:
+            self.tree.blockSignals(False)
+
+    def select_skill(self, skill: Skill) -> bool:
+        """Programmatically move the tree's current/selected row to the item
+        matching ``skill.path``, without firing ``skill_selected``. Returns
+        True if a matching row was found and selected, False otherwise (e.g.
+        the skill is filtered out of the current view).
+
+        Used by ``MainWindow`` to restore the highlight when a skill switch
+        is rejected — the user cancels the unsaved-changes prompt and the
+        tree must visually re-match whatever the editor is actually showing.
+        Mirrors ``FileTreePanel.select_path``; both panels follow the rule
+        "user clicks may move the highlight; programmatic restores must not
+        re-fire the user-action signal."
+
+        Signals are blocked because ``QTreeWidget.setCurrentItem`` fires the
+        same ``itemSelectionChanged`` that the original click did. Without
+        the block, the restore would re-enter ``_on_selection``, re-emit
+        ``skill_selected``, and the discard prompt would loop indefinitely
+        for the same dirty buffer."""
+        self.tree.blockSignals(True)
+        try:
+            for i in range(self.tree.topLevelItemCount()):
+                header = self.tree.topLevelItem(i)
+                for j in range(header.childCount()):
+                    item = header.child(j)
+                    stored = item.data(0, Qt.UserRole)
+                    if isinstance(stored, Skill) and stored.path == skill.path:
+                        self.tree.setCurrentItem(item)
+                        self.tree.scrollToItem(item)
+                        return True
+            return False
         finally:
             self.tree.blockSignals(False)
 
@@ -550,6 +595,16 @@ class SkillListPanel(QWidget):
 
         menu = QMenu(self)
 
+        # "Test Skill…" sits at the top — it's the most action-oriented
+        # entry in the menu (everything else is read-only metadata
+        # copying), and putting it first matches the convention that
+        # primary actions live above secondary ones. Always enabled
+        # because the dialog itself handles every skill type / state
+        # gracefully (a disabled skill can still be tested; the
+        # response just shows that ``claude`` ignored it).
+        act_test = menu.addAction("Test Skill…")
+        menu.addSeparator()
+
         # Enable / Disable — meaningful only for Global/Project skills with a
         # binary state. Plugin skills inherit their plugin's state and
         # non-binary states (name-only, user-invocable-only) are read-only
@@ -583,12 +638,27 @@ class SkillListPanel(QWidget):
         menu.addSeparator()
         act_open     = menu.addAction("Open Folder in Explorer")
 
+        # Delete Skill — destructive, soft (Recycle Bin), Global/Project
+        # only. Hidden entirely for Plugin skills per spec; plugin
+        # folders are managed elsewhere (the marketplace install) and a
+        # delete here would orphan plugin manifests. The ellipsis ("…")
+        # signals to the user that this opens a confirmation flow, not
+        # an immediate destructive action — same convention as
+        # "Test Skill…" above.
+        act_delete = None
+        if skill.type != SkillType.PLUGIN:
+            menu.addSeparator()
+            act_delete = menu.addAction("Delete Skill…")
+
         # Identity comparison rather than string match — robust to future
         # label edits or localization.
         chosen = menu.exec(self.tree.viewport().mapToGlobal(pos))
         if chosen is None:
             return
 
+        if chosen is act_test:
+            self.test_skill_requested.emit(skill)
+            return
         if chosen is act_enable:
             self.state_change_requested.emit(skill, STATE_ON)
             return
@@ -608,3 +678,10 @@ class SkillListPanel(QWidget):
             clip.setText(QUrl.fromLocalFile(str(skill.path)).toString())
         elif chosen is act_open:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(skill.path)))
+        elif act_delete is not None and chosen is act_delete:
+            # MainWindow owns the double-confirmation flow and the
+            # actual recycle-bin call; this panel only emits the
+            # request, matching the panel-emits-signal /
+            # MainWindow-handles-effect pattern used by Enable/Disable
+            # and Test Skill above.
+            self.delete_skill_requested.emit(skill)
