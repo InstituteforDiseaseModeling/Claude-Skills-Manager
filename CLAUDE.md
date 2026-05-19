@@ -39,6 +39,7 @@ These come from concrete bugs documented in `DESIGN.md` §7. Re-introducing them
 - **Cross-panel coordination via signals only.** `skill_selected`, `file_activated`, `file_saved` flow up to `MainWindow`; method calls flow down. Adding a direct panel-to-panel reference couples them and breaks the per-panel `clear()` orchestration in `MainWindow.refresh()`.
 - **Lazy `QFileSystemModel` attachment.** `FileTreePanel.tree` has no model until first `show_directory()`. An attached-but-unrooted `QTreeView + QFileSystemModel` shows the Windows drive list, which is wrong for "no skill selected."
 - **Description tab ≠ Editor tab — intentionally.** Description renders the *selected skill's* `SKILL.md` (markdown, frontmatter stripped, name + description as header). Editor shows whatever *file* the user clicked, raw. Re-render Description on `tabs.currentChanged`, not on every keystroke.
+- **Splash is app-start only — never on Refresh.** `main.py` drives the startup splash (§7.57); Refresh / F5 / Choose-root / context-menu re-scans keep the in-status-bar busy indicator (§7.33) and must not re-summon the splash. `MainWindow.__init__` exposes a `defer_initial_scan: bool = False` knob for exactly one caller (`main.py`) so the first scan runs *before* the main window is shown, under the splash. Handoff order is `splash.close() → window.show()`, not the reverse — the reverse paints an empty main window behind the still-visible splash for a frame and reads as a launch glitch.
 
 ## Project-scan knobs
 

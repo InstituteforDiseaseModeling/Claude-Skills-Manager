@@ -4624,6 +4624,140 @@ nav to `—` with both buttons disabled.
 
 ---
 
+### 7.57 Startup splash window
+
+**User observation that drove it.** *"Add splash feature to the main
+frame. Show splash first when run app during the main frame
+searching/loading skills. Once all skills loaded, the splash
+disappears and the main form shows up. This splash functionality
+only applies to the app starts — when users click Refresh, the
+behavior will be the same as it was (no change)."*
+
+Launching the app went straight from a black terminal into the
+fully-populated main window. On a fast machine the first scan
+finishes in <500 ms, but on a network-mounted home directory or
+a large project root, the user can stare at nothing for a
+noticeable beat before the window appears. Even on the fast path,
+the cold-launch "is anything happening?" feel was worth fixing.
+
+**Five sub-decisions worth keeping.**
+
+**(1) Custom `QWidget` over Qt's built-in `QSplashScreen`.** Qt
+ships a dedicated `QSplashScreen` class, but it's pixmap-centric:
+you hand it an image and call `showMessage()` to paint text on
+top. For a structured layout — logo + bold title + tagline +
+status line + indeterminate progress bar — `QSplashScreen` forces
+you to either render the whole composite into a single pixmap
+(rigid; can't update individual pieces) or layer text-over-image
+(visually crude). A plain `QWidget` with the **`Qt.SplashScreen`
+window flag** (note: the *flag*, not the *class*) gets you
+exactly the same window behavior — frameless, no taskbar entry,
+no focus-stealing — while letting you compose the surface with
+normal layout primitives. Future iterations (e.g., a Retry
+button on scan-error, a project-root preview) cost nothing.
+
+**(2) Synchronous scan inside the splash, not threaded.** The
+scanner is intentionally Qt-free (per CLAUDE.md's layering rule),
+which means a threaded path would need either thread-local cwd
+handling or queued-connection signal marshaling for the result.
+Both are overkill for a sub-second operation. The shape we
+adopted mirrors the existing `MainWindow._busy` context manager
+one level up: show the splash, pump `processEvents()` once for
+first paint, run the sync `window.refresh()`, then close. The
+splash's indeterminate `QProgressBar` (range `(0, 0)`) animates
+its sliding fill as long as the event loop ticks — `set_status`
+forces a tick after every status flip so the animation actually
+advances during the scan.
+
+**(3) `defer_initial_scan` knob on `MainWindow.__init__`.**
+Previously `MainWindow.__init__` ended with
+`QTimer.singleShot(0, self.refresh)` — schedule the first scan
+for the next event-loop tick so the window has a chance to paint
+before the scan blocks (§7.33's rationale). That trick is exactly
+wrong for the splash path: we want the scan to run *before* the
+window is shown, not after. Adding a `defer_initial_scan: bool =
+False` constructor parameter inverts the behaviour without
+forking the code path — `main.py` constructs with `True`, runs
+`window.refresh()` itself, then `window.show()`. Refresh / F5 /
+choose-root / context-menu paths still call `self.refresh()`
+directly and don't go through the flag, so they are mechanically
+unaffected.
+
+**(4) Splash drives `processEvents()` from inside `set_status`.**
+Between two back-to-back synchronous Python calls the Qt event
+loop is dormant. A `splash.set_status("Loading interface…")`
+followed immediately by `window = MainWindow(...)` followed by
+`splash.set_status("Scanning skills…")` would coalesce the two
+updates — the user would only see "Scanning skills…" repaint,
+never the intermediate state. The fix is to pump `processEvents()`
+inside `set_status()` itself, so every caller gets one repaint
+for free. That makes status updates self-contained and removes
+the need for callers to remember the pump.
+
+**(5) Order matters: `splash.close() → window.show()`.** Both
+permutations technically work. The wrong one is visible: showing
+the main window first puts a freshly-painted (but tile-flashing)
+window *behind* the still-up splash for one or two frames before
+the splash closes, which reads as a launch-glitch. Closing the
+splash first means the only handoff frame the user sees is
+"empty desktop → fully-populated main window," which reads as
+intentional. Cheap to get right, easy to forget — worth nailing
+in the canonical order.
+
+**Splash is app-start only.** Refresh / F5 / Choose project root /
+post-save SKILL.md rescan / post-delete rescan all keep the
+in-status-bar busy indicator (§7.33) and never re-summon the
+splash. Stealing the user back to a launch surface on every
+re-scan would be jarring; the busy indicator is the right
+affordance for the "I'm still in the app, just waiting" case.
+The two indicators serve different mental states — splash =
+"boot," busy bar = "operation in progress on the open window."
+
+**Resulting startup sequence (`main.py`).**
+
+```python
+splash = SplashWindow()
+splash.show()
+app.processEvents()  # force first paint
+
+splash.set_status("Loading interface…")
+window = MainWindow(defer_initial_scan=True)
+
+splash.set_status("Scanning skills…")
+window.refresh()  # synchronous; splash stays on top throughout
+
+splash.close()
+window.show()
+return app.exec()
+```
+
+`Qt.SplashScreen | Qt.WindowStaysOnTopHint` keeps the splash
+above the main window during the brief overlap when `MainWindow`
+exists but hasn't been shown yet. `WA_ShowWithoutActivating`
+prevents the splash from stealing focus from any window the user
+might already have on screen (e.g., the terminal they launched
+from).
+
+> Lesson 1: when adding a startup affordance, look for the
+> existing "deferred until first paint" mechanism in
+> `__init__` and add a knob to opt out — don't fork the
+> constructor. The deferred-scan pattern was added in §7.33
+> for the post-show case; the same line is the inversion point
+> for the pre-show case.
+
+> Lesson 2: pump `processEvents()` inside the API that updates
+> visible state, not at every caller site. `set_status(text)`
+> that *doesn't* pump is a footgun — callers that batch two
+> updates will silently lose the intermediate one, and the bug
+> won't appear until the splash is on a slow machine.
+
+> Lesson 3: ordering of "close A, show B" sequences during
+> launch is a perceptual concern, not a logical one. The wrong
+> order still works; it just looks broken. Write the canonical
+> order down where the reader will find it (`main.py` comment
+> block), so a future refactor doesn't reverse it for "logical
+> symmetry" reasons.
+
 ## 8. Cross-Cutting Patterns
 
 Several patterns recur across the iterations and are worth preserving as
@@ -4703,14 +4837,14 @@ First scan finds Global + Plugin skills under `~/.claude/`. Click
 
 | File | Lines (approx) | Role |
 |---|---|---|
-| `main.py` | 98 | Boots `QApplication` + `MainWindow`; registers Windows AppUserModelID (§7.22) so the taskbar shows the app's icon, not python.exe's; installs a Qt message-handler filter that suppresses the cosmetic `qt.qpa.screen` "Unable to open monitor interface" warning (§7.31) while passing everything else through to stderr |
+| `main.py` | 130 | Boots `QApplication` + `MainWindow`; registers Windows AppUserModelID (§7.22) so the taskbar shows the app's icon, not python.exe's; installs a Qt message-handler filter that suppresses the cosmetic `qt.qpa.screen` "Unable to open monitor interface" warning (§7.31) while passing everything else through to stderr. **Startup splash flow** (§7.57): constructs and shows `SplashWindow`, pumps `processEvents()` for first paint, then `MainWindow(defer_initial_scan=True)` + synchronous `window.refresh()` while the splash is the visible surface, then `splash.close()` → `window.show()` → `app.exec()`. Ordering is load-bearing — see §7.57's sub-decision (5) |
 | `claude_skills_manager/models.py` | 39 | `Skill` dataclass (+ state, plugin_id) + `SkillType` enum |
 | `claude_skills_manager/skill_md.py` | 136 | YAML frontmatter + first-paragraph parser; chars-per-token estimator; **`strip_frontmatter`** with the §7.28 orphan-`---` defense — promoted from `editor_panel` so both the editor's Preview tab and the test dialog's Description tab share one implementation (§7.34) |
 | `claude_skills_manager/skill_settings.py` | 134 | `skillOverrides` + `enabledPlugins` read/write; refuses to overwrite malformed JSON |
 | `claude_skills_manager/claude_trust.py` | 137 | Qt-free seam for the §7.55 "Trust this folder" gate. `is_path_trusted(path)` returns tri-state `Optional[bool]` (True / False / None-for-missing-config), `mark_path_trusted(path)` writes `projects.<forward-slash-key>.hasTrustDialogAccepted=true` to `~/.claude.json` via atomic temp-file + `os.replace`. `normalize_trust_key` centralizes the load-bearing forward-slash conversion (Windows backslash keys are silently ignored by the CLI). Refuses to auto-create a stub config — falls through to `FileNotFoundError` so the CLI's own first-run initialization isn't pre-empted |
 | `claude_skills_manager/scanner.py` | 321 | 3-source discovery (manifest-driven plugin discovery + legacy fallback), recursive project walk, dedup, state-population pass (per-skill scope) |
 | `claude_skills_manager/skill_introspect.py` | 376 | Qt-free helpers for the test dialog (§7.34): example/summary extraction from a Skill's SKILL.md, `claude` CLI command construction, working-directory selection. Holds every decision a future runner needs (argv shape, cwd, example precedence) so the dialog can stay a presentation layer. Adds `find_claude_executable()` (§7.38, PATHEXT-aware via `shutil.which` + common-location fallback covering npm-global / pipx-local / installer paths) and `claude_path_diagnostic()` (renders a human-readable PATH report for the FailedToStart case) — used by both dialogs so QProcess always receives a fully-qualified path |
-| `ui/main_window.py` | 883 | Toolbar (logo + Type + State filter groups, rich-text section labels, leading-magnifier search box per §7.23, refresh-icon button per §7.32, **Test Skill** button + Ctrl+T per §7.34, **Check Claude** button per §7.36), nested splitters, signal routing, `QSettings` persistence; validate-before-mutate on Choose-root; image-vs-text dispatch in `on_file_activated`; restores file-tree selection on cancelled-discard (§7.25); restores skill-list selection on cancelled cross-skill switch (§7.51 — calls `skill_list.select_skill(self._current_skill)`); search empty↔non-empty transition resets selection (§7.26 + §7.27); `_busy` context manager coordinates cursor + indeterminate progress bar + disabled-button busy state, initial scan deferred to first paint via `QTimer.singleShot` (§7.33); per-skill `_test_dialogs` registry + `open_test_dialog` raises-existing-or-creates (§7.34); single-instance `_check_claude_dialog` + `_on_check_claude_clicked` (§7.36); binds Windows taskbar icon via per-window IPropertyStore in `showEvent` (§7.22) |
+| `ui/main_window.py` | 883 | Toolbar (logo + Type + State filter groups, rich-text section labels, leading-magnifier search box per §7.23, refresh-icon button per §7.32, **Test Skill** button + Ctrl+T per §7.34, **Check Claude** button per §7.36), nested splitters, signal routing, `QSettings` persistence; validate-before-mutate on Choose-root; image-vs-text dispatch in `on_file_activated`; restores file-tree selection on cancelled-discard (§7.25); restores skill-list selection on cancelled cross-skill switch (§7.51 — calls `skill_list.select_skill(self._current_skill)`); search empty↔non-empty transition resets selection (§7.26 + §7.27); `_busy` context manager coordinates cursor + indeterminate progress bar + disabled-button busy state, initial scan deferred to first paint via `QTimer.singleShot` (§7.33); **`defer_initial_scan: bool = False` constructor knob** (§7.57) lets `main.py` skip the deferred singleShot and drive the first scan synchronously under the startup splash — Refresh / F5 / Choose-root / context-menu paths bypass the flag and remain unaffected; per-skill `_test_dialogs` registry + `open_test_dialog` raises-existing-or-creates (§7.34); single-instance `_check_claude_dialog` + `_on_check_claude_clicked` (§7.36); binds Windows taskbar icon via per-window IPropertyStore in `showEvent` (§7.22) |
 | `ui/win32_taskbar.py` | 198 | Win32-only: per-window AppUserModelID + RelaunchIconResource binding via `SHGetPropertyStoreForWindow` and the `IPropertyStore` COM vtable. Pure ctypes (no comtypes / pywin32), silently no-ops on non-Windows or COM failure — see §7.22 |
 | `ui/skill_list.py` | 662 | Grouped tree with type + state + per-type-context search filtering (§7.30), selection styling, per-type badge icons (full + faded variants — see §7.19/§7.20), right-click copy/open/Enable/Disable/**Test Skill…** menu; **always-on plugin / project context** as `name · context` (§7.29) plus on-collision name disambiguation scoped per group header (§7.18); tooltip enrichment for plugin-off, in-place `refresh_state`; correct paint-then-tag-DPR ordering (§7.23); programmatic `clear_selection()` for search-clear reset (§7.26); `test_skill_requested` signal emitted from the context menu so the right-click and the toolbar button converge on one `open_test_dialog` path (§7.34); programmatic `select_skill(skill)` (§7.51) mirrors `FileTreePanel.select_path` — blocks signals during `setCurrentItem` so a cancel-discard restore doesn't re-fire `skill_selected` and silently swap back to the rejected target |
 | `ui/file_tree.py` | 79 | `QFileSystemModel`-backed tree, lazy attachment, `select_path()` for programmatic selection-restore on cancelled-discard (§7.25) |
@@ -4724,3 +4858,4 @@ First scan finds Global + Plugin skills under `~/.claude/`. Click
 | `ui/_styles.py` | 38 | Shared QSS constants (currently `BUTTON_STYLE`); single source of truth for per-widget stylesheet snippets, per the §8.5 "stylesheets scoped per widget" convention |
 | `ui/_icons.py` | 218 | Programmatic small UI icons — `search_icon()` (§7.23), `refresh_icon()` (§7.32, standard clockwise-arrow with filled arrowhead), and `test_icon()` (§7.34, stroked Erlenmeyer-flask silhouette for the Test Skill button). Separate from `app_icon.py` which is the brand logo. Same paint-then-tag-DPR pattern across all icons |
 | `ui/app_icon.py` | 132 | Programmatic three-shapes composite logo (circle + square + diamond in the per-type palette); three layers over a shared physical-pixel painter — `app_icon()` for window-icon multi-size pack, `app_logo_pixmap(logical_size)` for in-window toolbar use with HiDPI DPR, `write_logo_ico(path)` for on-disk .ico used by the Windows taskbar binding — see §7.21, §7.22 |
+| `ui/splash.py` | 175 | Frameless startup splash (§7.57): `Qt.SplashScreen | Qt.WindowStaysOnTopHint` window with `WA_ShowWithoutActivating` so it doesn't steal focus from windows the user already has on screen. 460×280 card with the 96 px composite logo, app name, tagline, status line, and indeterminate `QProgressBar`. `set_status(text)` updates the status label and calls `QApplication.processEvents()` internally so back-to-back synchronous status flips actually repaint instead of coalescing into the final state. Centered on the primary screen's *available* geometry (excludes taskbar / dock); falls back to a fixed top-left if `primaryScreen()` returns None very early in QApplication startup. Custom `QWidget` rather than Qt's built-in `QSplashScreen` so the layout can compose normal widgets — see §7.57 sub-decision (1) |

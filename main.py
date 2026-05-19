@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QApplication
 from claude_skills_manager.logging_setup import configure_logging, log_qt_message
 from claude_skills_manager.ui.app_icon import app_icon
 from claude_skills_manager.ui.main_window import MainWindow
+from claude_skills_manager.ui.splash import SplashWindow
 
 # AppUserModelID — a process-level identity string used by the Windows
 # taskbar to decide which icon to display for a running app. Without an
@@ -99,7 +100,37 @@ def main() -> int:
     # constructs QPixmaps internally.
     app.setWindowIcon(app_icon())
 
-    window = MainWindow()
+    # Splash window covers the gap between launch and the first scan
+    # completing. The flow is intentionally sync:
+    #
+    #   1. Show splash + force first paint.
+    #   2. Construct MainWindow with ``defer_initial_scan=True`` so its
+    #      built-in QTimer.singleShot(0, refresh) no-ops — without this,
+    #      the scan would race with the splash and could fire either
+    #      before or after we close it, depending on event-loop timing.
+    #   3. Run the initial scan synchronously via ``window.refresh()``
+    #      while the splash is the visible surface. ``set_status`` pumps
+    #      the event loop so the splash repaints between phases.
+    #   4. Close splash, then show window. Order matters: if we showed
+    #      the window first, the user would briefly see an empty main
+    #      window above the still-up splash before the splash closed,
+    #      which looks like a launch glitch.
+    #
+    # Refresh / F5 / Choose-root / right-click delete paths do NOT
+    # re-trigger the splash — those still flow through MainWindow's
+    # status-bar busy indicator. This is deliberate: stealing the user
+    # back to a launch-screen on every refresh would be jarring.
+    splash = SplashWindow()
+    splash.show()
+    app.processEvents()
+
+    splash.set_status("Loading interface…")
+    window = MainWindow(defer_initial_scan=True)
+
+    splash.set_status("Scanning skills…")
+    window.refresh()
+
+    splash.close()
     window.show()
     return app.exec()
 

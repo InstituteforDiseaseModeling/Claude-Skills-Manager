@@ -141,7 +141,15 @@ class _ViewMenuRow(QWidget):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, defer_initial_scan: bool = False) -> None:
+        """Build the main window.
+
+        ``defer_initial_scan``: when True, skip the implicit
+        post-show ``QTimer.singleShot(0, self.refresh)`` so the
+        caller (``main.py``) can drive the first scan synchronously
+        while the splash is on screen. Refresh-button / F5 / context
+        menu paths are unaffected — they call ``self.refresh()``
+        directly and don't go through this flag."""
         super().__init__()
         self.setWindowTitle("Claude Skills Manager")
         # Per-window icon for title bar / Alt+Tab. NOT sufficient on its
@@ -190,7 +198,14 @@ class MainWindow(QMainWindow):
         # user sees nothing while the scan is happening. ``singleShot(0)``
         # schedules the call for the next event-loop tick, after the
         # show event has fired.
-        QTimer.singleShot(0, self.refresh)
+        #
+        # When ``defer_initial_scan`` is True the caller takes over —
+        # main.py runs ``refresh()`` synchronously while the splash is
+        # the visible surface, then shows this window post-scan. The
+        # post-show paint argument doesn't apply in that path (this
+        # window isn't shown yet) so the singleShot isn't needed.
+        if not defer_initial_scan:
+            QTimer.singleShot(0, self.refresh)
 
     def showEvent(self, event) -> None:  # noqa: N802 — Qt naming
         super().showEvent(event)
