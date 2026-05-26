@@ -19,6 +19,7 @@ A path-walk fallback handles marketplaces with no manifest.
 """
 from __future__ import annotations
 
+import itertools
 import json
 import os
 from pathlib import Path
@@ -126,16 +127,62 @@ class SkillScanner:
     def scan_plugin(self) -> list[Skill]:
         """Discover plugin skills, preferring each marketplace's manifest as
         the source of truth and falling back to the legacy folder walk when
-        no manifest is present."""
-        marketplaces = self.home / ".claude" / "plugins" / "marketplaces"
-        out: list[Skill] = []
-        for marketplace in _iter_subdirs(marketplaces):
-            manifest = _read_marketplace_manifest(marketplace)
-            if manifest is None:
-                out.extend(self._scan_marketplace_legacy(marketplace))
-            else:
-                out.extend(self._scan_marketplace_manifest(marketplace, manifest))
-        return out
+        no manifest is present.
+
+        Two sources are scanned:
+        - Standard marketplaces cached under ~/.claude/plugins/marketplaces/
+        - Directory-based marketplaces registered in known_marketplaces.json
+          (added via `claude plugin marketplace add <path> --scope user`).
+          These are NOT copied to the marketplaces folder — they are
+          referenced directly by their installLocation path.
+        """
+        standard = _iter_subdirs(self.home / ".claude" / "plugins" / "marketplaces")
+        directory = self._iter_directory_marketplaces(self.home)
+        return [
+            skill
+            for marketplace in itertools.chain(standard, directory)
+            for skill in self._scan_marketplace(marketplace)
+        ]
+
+    def _scan_marketplace(self, marketplace: Path) -> list[Skill]:
+        """Scan one marketplace, using its manifest when present and
+        falling back to the legacy folder walk otherwise."""
+        manifest = _read_marketplace_manifest(marketplace)
+        if manifest is None:
+            return self._scan_marketplace_legacy(marketplace)
+        return self._scan_marketplace_manifest(marketplace, manifest)
+
+    def _iter_directory_marketplaces(self) -> Iterator[Path]:
+        """Yield marketplace paths that were added as local directories via
+        ``claude plugin marketplace add <path> --scope user``.
+
+        These are recorded in ``known_marketplaces.json`` with
+        ``source.source == "directory"`` and an ``installLocation`` pointing
+        directly at the local path — they are never copied to the standard
+        ``~/.claude/plugins/marketplaces/`` folder, so ``scan_plugin``'s
+        normal subdirectory walk misses them entirely."""
+        known = self.home / ".claude" / "plugins" / "known_marketplaces.json"
+        try:
+            with known.open(encoding="utf-8") as f:
+                data = json.load(f)
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return
+        if not isinstance(data, dict):
+            return
+        for _key, entry in data.items():
+            if not isinstance(entry, dict):
+                continue
+            source = entry.get("source", {})
+            if not isinstance(source, dict):
+                continue
+            if source.get("source") != "directory":
+                continue
+            install_location = entry.get("installLocation")
+            if not isinstance(install_location, str) or not install_location:
+                continue
+            p = Path(install_location)
+            if p.is_dir():
+                yield p
 
     def _scan_marketplace_manifest(
         self, marketplace: Path, manifest: dict[str, Any],
