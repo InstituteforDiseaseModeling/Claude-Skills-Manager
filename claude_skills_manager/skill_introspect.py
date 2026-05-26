@@ -329,7 +329,7 @@ def build_claude_command(
     *,
     model: str = "",
     session_id: str = "",
-    json_output: bool = False,
+    stream_json: bool = False,
     skip_permissions: bool = False,
     extra_read_dirs: Iterable[str | Path] | None = None,
 ) -> list[str]:
@@ -365,12 +365,21 @@ def build_claude_command(
     envelope (§7.46), giving the user multi-turn context within one
     open dialog.
 
-    ``json_output`` (optional) appends ``--output-format json``, which
-    makes ``claude`` emit a single JSON object instead of bare
-    markdown. Used by the dialog only when continuing, because the
-    session_id we need to capture lives inside that envelope. The
-    plain-text default round-trips byte-for-byte with the pre-resume
-    invocation shape so non-continuing runs are unaffected.
+    ``stream_json`` (optional) appends
+    ``--output-format stream-json --verbose`` — Claude Code's
+    newline-delimited JSON event stream. Each line is a self-
+    contained event (``system/init``, ``assistant`` text /
+    ``tool_use``, ``user`` ``tool_result``, terminal ``result``),
+    emitted as the run progresses rather than batched at exit. This
+    is the data source for the Test Skill dialog's Activity tab
+    (§7.60) — live "Claude is reading X, calling Bash, …" visibility,
+    same shape Claude Code's TUI consumes. The ``--verbose`` flag is
+    load-bearing: ``claude`` rejects ``--output-format stream-json``
+    in ``--print`` mode without it. Both event-stream-format flags
+    are emitted together so callers never have to remember the
+    pairing. Default is False so the plain-text invocation shape
+    (which other dialogs like Check Claude still rely on) is
+    unaffected.
 
     ``extra_read_dirs`` (optional) emits a single ``--add-dir`` flag
     followed by every path, granting ``claude`` read access in those
@@ -421,8 +430,10 @@ def build_claude_command(
         argv += ["--model", model]
     if session_id:
         argv += ["--resume", session_id]
-    if json_output:
-        argv += ["--output-format", "json"]
+    if stream_json:
+        # Both flags must travel together — ``claude`` rejects
+        # stream-json without --verbose in --print mode (§7.60).
+        argv += ["--output-format", "stream-json", "--verbose"]
     if skip_permissions:
         argv += ["--dangerously-skip-permissions"]
     if extra_read_dirs:
@@ -440,51 +451,6 @@ def build_claude_command(
     argv.append("--")
     argv.append(prompt)
     return argv
-
-
-def parse_claude_json_envelope(
-    stdout: str,
-) -> tuple[str, str | None, bool]:
-    """Parse the JSON envelope emitted by ``claude --output-format json``.
-
-    Returns ``(response_text, session_id_or_None, is_error)``:
-
-    * ``response_text`` — the assistant's reply, extracted from the
-      ``result`` field. Falls back to the raw ``stdout`` verbatim when
-      parsing fails so the user always sees *something* and can debug
-      from the Raw Output tab.
-    * ``session_id`` — the conversation id to feed back as
-      ``--resume`` on the next turn. ``None`` if absent or non-string.
-    * ``is_error`` — claude's own ``is_error`` flag; True means the
-      response represents an error condition (rate limit, permission
-      issue, etc.). Caller is expected to label the rendered output
-      accordingly so a downstream "looks like a normal answer" mistake
-      is avoided.
-
-    Pure function — no Qt, no logging, no side effects. Kept in the
-    domain layer so the dialog's UI code can stay focused on widget
-    plumbing."""
-    try:
-        data = json.loads(stdout.strip())
-    except (json.JSONDecodeError, ValueError):
-        return stdout, None, False
-    if not isinstance(data, dict):
-        return stdout, None, False
-
-    result = data.get("result")
-    if not isinstance(result, str) or not result:
-        # Some failure modes (auth error, rate limit) put the
-        # message in `error` / `message` instead. Fall through to
-        # the raw stdout so the user sees claude's own wording
-        # instead of an empty pane.
-        result = stdout
-
-    session_id = data.get("session_id")
-    if not isinstance(session_id, str) or not session_id:
-        session_id = None
-
-    is_error = bool(data.get("is_error", False))
-    return result, session_id, is_error
 
 
 def claude_env_overrides(api_key: str = "") -> dict[str, str]:

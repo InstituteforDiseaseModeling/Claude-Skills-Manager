@@ -14,20 +14,28 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QSettings, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
-    QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QSizePolicy,
-    QSplitter, QStatusBar, QToolBar, QToolButton, QWidget, QWidgetAction,
+    QApplication, QCheckBox, QDialog, QFileDialog, QHBoxLayout, QLabel,
+    QLineEdit, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton,
+    QSizePolicy, QSplitter, QStatusBar, QToolBar, QToolButton, QWidget,
+    QWidgetAction,
 )
 
 from ..logging_setup import log_file_path
 from ..models import Skill, SkillType
 from ..recycle import send_to_recycle_bin
 from ..scanner import SkillScanner
-from ..skill_settings import STATE_ON, write_override
+from ..skill_relocate import (
+    PartialMoveError, RelocationCollision, copy_skill, move_skill,
+    resolve_destination,
+)
+from ..skill_settings import STATE_ON, STATE_PLUGIN_OFF, write_override
 from ._icons import close_icon, refresh_icon, search_icon
 from ._styles import BUTTON_STYLE
+from ..ai_tools import AITool, load_ai_tools
 from .about_dialog import AboutDialog
+from .ai_tool_dialog import AIToolDialog
 from .app_icon import app_icon, app_logo_pixmap, write_logo_ico
+from .edit_resource_dialog import EditResourceDialog
 from .win32_taskbar import apply_window_appusermodel
 from .editor_panel import EditorPanel
 from .file_tree import FileTreePanel
@@ -38,6 +46,7 @@ from .skill_list import (
     STATE_GROUP_DISABLED, STATE_GROUP_ENABLED, SkillListPanel,
 )
 from .check_claude_dialog import CheckClaudeDialog
+from .new_skill_dialog import NewSkillDialog
 from .test_dialog import TestSkillDialog
 
 _logger = logging.getLogger("main_window")
@@ -69,8 +78,8 @@ _IMAGE_EXTS = frozenset({
 })
 
 
-class _ViewMenuRow(QWidget):
-    """Custom widget rendered inside a QWidgetAction in the View menu.
+class _WindowMenuRow(QWidget):
+    """Custom widget rendered inside a QWidgetAction in the Window menu.
 
     Two click zones share one row:
 
@@ -86,7 +95,7 @@ class _ViewMenuRow(QWidget):
     Hover styling is restated here because ``QWidgetAction``'s
     embedded widget doesn't inherit the menu's native hover palette
     — by default the row looks dead. The selector targets the
-    widget class via ``QWidget#viewMenuRow`` so the rule doesn't
+    widget class via ``QWidget#windowMenuRow`` so the rule doesn't
     cascade to children (especially the QToolButton, which has
     its own ``autoRaise`` hover behavior)."""
 
@@ -95,7 +104,7 @@ class _ViewMenuRow(QWidget):
 
     def __init__(self, title: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setObjectName("viewMenuRow")
+        self.setObjectName("windowMenuRow")
         # Wider min-width than a typical menu so titles like
         # "Test Skill — explain-github-workflow" don't elide.
         self.setMinimumWidth(380)
@@ -123,7 +132,7 @@ class _ViewMenuRow(QWidget):
         # Scoped via objectName so the rule doesn't leak to children;
         # the close button keeps its own QToolButton:hover style.
         self.setStyleSheet("""
-            QWidget#viewMenuRow:hover {
+            QWidget#windowMenuRow:hover {
                 background: #e8eef9;
             }
             QToolButton:hover {
@@ -327,6 +336,16 @@ class MainWindow(QMainWindow):
         self.refresh_btn.setStyleSheet(BUTTON_STYLE)
         self.refresh_btn.setShortcut(QKeySequence.Refresh)  # F5
         self.refresh_btn.clicked.connect(self.refresh)
+
+        # NOTE: "New Skill" toolbar button was intentionally removed.
+        # Skill creation is reachable two ways now:
+        #   * File menu → "&New Skill…" (Ctrl+N) — global affordance.
+        #   * Right-click on the "Global" or "Project" group header
+        #     in the left skill list — contextual, prefills the
+        #     Type radio with the section clicked.
+        # The toolbar button was redundant given those two paths and
+        # kept a less-contextual affordance taking up toolbar real
+        # estate. See §7.58 for the iteration history.
         # NOTE: "Test Skill…" and "Check Claude" buttons were intentionally
         # removed from the toolbar. The per-skill test runner lives in the
         # right-click context menu only; the CLI health check moved to
@@ -375,7 +394,21 @@ class MainWindow(QMainWindow):
         bar.addWidget(choose_root)
         bar.addSeparator()
         bar.addWidget(self.refresh_btn)
-        bar.addSeparator()
+
+        # Expanding spacer pushes Type/State filters AND the search
+        # box together to the right edge. Single spacer per toolbar:
+        # ``QSizePolicy.Expanding`` is a one-shot push that absorbs
+        # all free horizontal space at one point in the
+        # left-to-right order, so everything declared after it
+        # right-aligns as a group. Earlier iterations placed the
+        # spacer between State and search to right-align only the
+        # search; moving it ahead of Type pulls the filters along
+        # too, matching the "filters live next to the search" UX
+        # the user asked for.
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        bar.addWidget(spacer)
+
         bar.addWidget(_section_label("Type:"))
         bar.addWidget(self.cb_global)
         bar.addWidget(self.cb_project)
@@ -384,11 +417,6 @@ class MainWindow(QMainWindow):
         bar.addWidget(_section_label("State:"))
         bar.addWidget(self.cb_enabled)
         bar.addWidget(self.cb_disabled)
-
-        # Expanding spacer pushes the search box to the right edge.
-        spacer = QWidget()
-        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        bar.addWidget(spacer)
         bar.addWidget(self.search)
         return bar
 
@@ -415,9 +443,122 @@ class MainWindow(QMainWindow):
         self.skill_list.test_skill_requested.connect(self.open_test_dialog)
         self.skill_list.delete_skill_requested.connect(
             self._on_delete_skill_requested)
+        # Group-header right-click "New … Skill…" → open the
+        # creation dialog with the section's type preselected. Same
+        # signal-up / MainWindow-handles-effect pattern as Test and
+        # Delete above. The lambda captures the SkillType payload as
+        # the dialog's ``initial_type`` so right-clicking Global
+        # opens with Global selected, etc.
+        self.skill_list.new_skill_requested.connect(
+            lambda t: self.open_new_skill_dialog(initial_type=t))
+        # Drag-drop a Project skill onto the Global header (§7.66).
+        # Receiver pops a Copy / Move / Cancel confirmation dialog and
+        # dispatches to ``skill_relocate``. Plugin source / target are
+        # rejected at the UI layer (no drag flag / no drop flag) and at
+        # the domain layer (ValueError in skill_relocate); the receiver
+        # is the user-facing surface for any errors that slip through.
+        self.skill_list.skill_drop_requested.connect(self._on_skill_drop)
         self.skill_info.state_change_requested.connect(self._on_state_change_requested)
         self.file_tree.file_activated.connect(self.on_file_activated)
         self.editor_panel.file_saved.connect(self._on_file_saved)
+        self._install_shortcuts()
+
+    def _install_shortcuts(self) -> None:
+        """Window-scoped hotkeys that act on the currently selected
+        skill in the left list (§7.69).
+
+        These QActions are headless — not attached to any menu — but
+        ``self.addAction(...)`` parents them on the main window so the
+        WindowShortcut context fires whenever this window is active and
+        a skill is selected. The skill-list right-click menu shows the
+        chord in its right gutter via a ``\\t``-suffixed label rather
+        than a real ``setShortcut`` on the transient menu QAction —
+        that avoids the "ambiguous shortcut" warning Qt emits when two
+        QActions in the same context have the same key sequence (one
+        persistent here, one transient on the menu).
+
+        Both handlers no-op when no skill is selected; we *don't*
+        disable the QAction itself, because enabling/disabling on
+        every selection change would require wiring an extra signal,
+        and the no-skill case is rare and silent (no toast, no error
+        — pressing Ctrl+T on an empty selection is a user-error the
+        UI doesn't need to call out)."""
+        self._test_skill_action = QAction("Test Skill", self)
+        self._test_skill_action.setShortcut(QKeySequence("Ctrl+T"))
+        self._test_skill_action.setShortcutContext(Qt.WindowShortcut)
+        self._test_skill_action.triggered.connect(
+            self._on_test_skill_shortcut)
+        self.addAction(self._test_skill_action)
+
+        self._open_folder_action = QAction(
+            "Open Folder in Explorer", self)
+        self._open_folder_action.setShortcut(QKeySequence("Ctrl+E"))
+        self._open_folder_action.setShortcutContext(Qt.WindowShortcut)
+        self._open_folder_action.triggered.connect(
+            self._on_open_folder_shortcut)
+        self.addAction(self._open_folder_action)
+
+        # Ctrl+D / Del — Delete Skill… (Global/Project only, mirrors
+        # the right-click menu which hides the entry entirely for
+        # Plugin skills per §7.58 / the per-type mutation rule). Same
+        # window-scoped, no-op-on-empty pattern as Ctrl+T / Ctrl+E.
+        # The real double-confirmation flow lives in
+        # ``_on_delete_skill_requested`` — kept centralized there so
+        # right-click, Ctrl+D, and Del share one code path.
+        #
+        # Two alternates via ``setShortcuts([...])`` (plural) — Qt's
+        # shortcut engine matches either. The bare Delete key is safe
+        # here because Qt routes key events to the focus widget first:
+        # ``QLineEdit`` (search) and ``QTextEdit`` (editor) consume
+        # Delete for character erasure before shortcut matching, so
+        # this binding only fires when focus is on a widget that
+        # doesn't swallow the key (skill list, file tree, the window
+        # chrome itself). The two-step confirmation flow is a second
+        # safety net for the file-tree-focused edge case.
+        self._delete_skill_action = QAction("Delete Skill…", self)
+        self._delete_skill_action.setShortcuts([
+            QKeySequence("Ctrl+D"),
+            QKeySequence("Del"),
+        ])
+        self._delete_skill_action.setShortcutContext(Qt.WindowShortcut)
+        self._delete_skill_action.triggered.connect(
+            self._on_delete_skill_shortcut)
+        self.addAction(self._delete_skill_action)
+
+    def _on_test_skill_shortcut(self) -> None:
+        """Ctrl+T handler — opens the Test Skill dialog for the
+        currently selected skill. No-op when nothing is selected."""
+        if self._current_skill is None:
+            return
+        self.open_test_dialog(self._current_skill)
+
+    def _on_delete_skill_shortcut(self) -> None:
+        """Ctrl+D handler — initiates the Delete Skill… flow for the
+        currently selected skill. Silent no-op when nothing is
+        selected, or when the selection is a Plugin skill (Plugin
+        skills can't be deleted from the GUI — same gating the
+        right-click menu enforces by hiding the entry). The actual
+        double-confirmation + Recycle-Bin work is delegated to
+        ``_on_delete_skill_requested`` so right-click and Ctrl+D
+        funnel through one code path."""
+        if self._current_skill is None:
+            return
+        if self._current_skill.type == SkillType.PLUGIN:
+            return
+        self._on_delete_skill_requested(self._current_skill)
+
+    def _on_open_folder_shortcut(self) -> None:
+        """Ctrl+E handler — reveals the currently selected skill's
+        folder in the system file manager. No-op when nothing is
+        selected. Same backend as the context-menu 'Open Folder in
+        Explorer' entry (``QDesktopServices.openUrl`` on a
+        ``file://`` URL), kept inline rather than routed through a
+        signal because it's a pure local side-effect with no
+        MainWindow state to mutate."""
+        if self._current_skill is None:
+            return
+        QDesktopServices.openUrl(
+            QUrl.fromLocalFile(str(self._current_skill.path)))
 
     # ------------------------------------------------------------------ slots
     def choose_project_root(self) -> None:
@@ -439,31 +580,53 @@ class MainWindow(QMainWindow):
     def _on_search_changed(self, text: str) -> None:
         """Search-box ``textChanged`` handler.
 
-        The skill-list filter updates on every keystroke. Selection reset
-        fires only on **empty <-> non-empty transitions**, not on every
-        character typed:
+        The skill-list filter updates on every keystroke. Reset of the
+        middle/right panels fires in exactly the cases that leave the
+        left list with **no visually-selectable highlight** for the
+        previously-current skill:
 
-        * **empty → non-empty** (user started searching): drop the
-          selection so middle and right panels go blank. Per user spec
-          §7.27: "since there is no skill is selected."
-        * **non-empty → empty** (X click or backspace-all): same reset
-          — the "start over" gesture mirroring app-start and Refresh.
-        * **non-empty → non-empty** (refining the search): no-op. We
-          already dropped on the first keystroke; re-running the reset
-          on every keystroke would prompt the user about unsaved
-          changes repeatedly, which is unusable.
+        * **empty → non-empty** / **non-empty → empty** (boundary
+          transitions): the "context change" / "start over" gestures
+          from §7.27. Reset regardless of whether the current skill
+          still matches — typing a fresh query is itself the deselect.
+        * **non-empty → non-empty refinement** *that filtered the
+          current skill out of view* (§7.61): without this case, the
+          state machine in §7.27 leaves middle/right populated with a
+          skill the user can no longer see in the left list. Probed
+          via ``select_skill`` — its side effect of *restoring* the
+          tree highlight is desirable too, because every
+          ``_rebuild()`` (one per keystroke) clears the visual
+          selection along with the old items.
+        * All other non-empty → non-empty refinements: no-op. The
+          per-keystroke ``confirm_close`` prompt is avoided exactly
+          because we only fall into the reset branch when visibility
+          actually changes — typing within a stable result set just
+          re-asserts the same selection.
 
         If the editor has unsaved changes, ``confirm_close()`` prompts.
-        On Cancel we keep the selection and the new empty state. The
-        user has to save/discard before the next transition triggers a
-        new prompt — same handshake pattern as ``refresh()``."""
+        On Cancel we keep the current skill and the panels' content;
+        the user has to save/discard before the next transition
+        triggers a new prompt — same handshake pattern as
+        ``refresh()``."""
         self.skill_list.set_filter(text)
         empty_now = not text
         was_empty = self._search_was_empty
         self._search_was_empty = empty_now
 
-        if was_empty == empty_now or self._current_skill is None:
+        if self._current_skill is None:
             return
+
+        boundary = (was_empty != empty_now)
+        if not boundary:
+            # Non-empty → non-empty (or the no-op empty → empty path,
+            # which select_skill handles harmlessly). If the current
+            # skill is still visible under the new filter, re-select
+            # it — _rebuild dropped the tree's visual selection along
+            # with the old item set — and bail. Otherwise fall through
+            # to the panel-reset branch (§7.61 bug fix).
+            if self.skill_list.select_skill(self._current_skill):
+                return
+
         if not self.editor_panel.confirm_close():
             return
         self._current_skill = None
@@ -515,7 +678,20 @@ class MainWindow(QMainWindow):
             self.busy_bar.hide()
             self.refresh_btn.setEnabled(True)
 
-    def refresh(self) -> None:
+    def refresh(self, *, on_progress=None) -> None:
+        """Re-scan all three skill sources and repopulate the left list.
+
+        ``on_progress`` (keyword-only) is forwarded to
+        ``SkillScanner.scan_all`` for the launch-time splash pump
+        (see §7.62). Only ``main.py`` passes it — F5 / Refresh
+        button / Choose-root / context-menu paths leave it at
+        ``None`` so the status-bar busy bar's behavior is unchanged
+        (pumping events while MainWindow is visible would surface
+        queued user input mid-scan, which the sync-refresh contract
+        doesn't handle). The startup path is special because the
+        main window isn't visible yet — only the splash is on
+        screen, so pumping events does nothing user-facing besides
+        advancing the marquee."""
         if not self.editor_panel.confirm_close():
             return
         # Wipe panels so stale state from before the rescan can't linger:
@@ -527,7 +703,8 @@ class MainWindow(QMainWindow):
 
         with self._busy("Scanning skills…"):
             try:
-                skills = self._scanner.scan_all(self._project_root)
+                skills = self._scanner.scan_all(
+                    self._project_root, on_progress=on_progress)
             except Exception as e:  # last-ditch: keep the UI alive
                 QMessageBox.warning(self, "Scan error", str(e))
                 self.statusBar().showMessage(f"Scan error: {e}", 5000)
@@ -582,7 +759,7 @@ class MainWindow(QMainWindow):
         dialog.closed.connect(self._on_test_dialog_closed)
         self._test_dialogs[skill.path] = dialog
         dialog.show()
-        self._rebuild_view_menu()
+        self._rebuild_window_menu()
 
     def _on_test_dialog_closed(self, skill_path) -> None:
         """``TestSkillDialog.closed`` slot — drop the entry from the
@@ -594,7 +771,7 @@ class MainWindow(QMainWindow):
         built-in registration for ``pathlib.Path`` signals; we coerce
         to ``Path`` only for the dict lookup."""
         self._test_dialogs.pop(Path(skill_path), None)
-        self._rebuild_view_menu()
+        self._rebuild_window_menu()
 
     def open_check_claude_dialog(self) -> None:
         """Open (or re-focus) the singleton health-check dialog (§7.36).
@@ -619,9 +796,124 @@ class MainWindow(QMainWindow):
         Mirrors ``_on_test_dialog_closed`` for the per-skill case."""
         self._check_claude_dialog = None
 
+    def open_new_skill_dialog(
+        self, *, initial_type: SkillType | None = None,
+    ) -> None:
+        """Open the modal "New Skill" creation form. On accept,
+        refresh the skill list and select the new skill (which
+        routes through ``on_skill_selected`` to populate the file
+        tree and Description tab).
+
+        Per-type gating lives inside the dialog: Plugin is
+        permanently disabled. Global and Project are both always
+        enabled — the dialog has its own editable Project root
+        field (prefilled with ``self._project_root`` when set),
+        so the user can drop a skill into any folder without
+        bouncing back to the main window first.
+
+        ``initial_type`` (keyword-only) preselects the Type radio
+        when provided — used by the group-header right-click flow
+        in the left skill list. ``None`` (the default, used by the
+        File menu / Ctrl+N path) falls through to the dialog's own
+        default-Type logic."""
+        dialog = NewSkillDialog(
+            self,
+            project_root=self._project_root,
+            initial_type=initial_type,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        new_path = dialog.created_skill_md_path
+        if new_path is None:
+            # Dialog accepted without setting the path — defensive
+            # branch; should never happen because _on_create_clicked
+            # only calls accept() after setting created_skill_md_path.
+            return
+
+        self.refresh()
+        # After refresh, the new skill is in the scanner's result.
+        # Find by skill_md_path so we pick the right entry even if a
+        # case-collision somehow slipped through (it shouldn't, but
+        # belt + suspenders against future case-sensitivity bugs).
+        new_skill = self._find_skill_by_md_path(new_path)
+        if new_skill is None:
+            # The file exists on disk but didn't appear in the scan
+            # result. Two common causes:
+            #   (a) A Type/State filter checkbox is hiding the row.
+            #   (b) The user created a Project skill under a root
+            #       different from the MainWindow's _project_root,
+            #       so the scanner walked a different folder. The
+            #       dialog supports per-instance roots (different
+            #       from the main window's value) precisely for
+            #       this use case, so it's a real-world flow, not
+            #       a corner case.
+            #
+            # ``QMessageBox.information`` rather than a status-bar
+            # flash because the user expected a visible new row in
+            # the list and *didn't* get one — they need to act
+            # (adjust filters or switch root) before the new skill
+            # surfaces. A modal acknowledgment makes that requirement
+            # impossible to miss.
+            QMessageBox.information(
+                self,
+                "Skill created",
+                f"Skill <b>{new_path.parent.name}</b> was "
+                f"successfully created at:<br><br>"
+                f"<code>{new_path}</code><br><br>"
+                "It isn't visible in the list right now — adjust "
+                "the Type/State filters, or switch the project "
+                "root in the main window to see it.")
+            return
+
+        # ``select_skill`` blocks signals (it's designed for the
+        # restore-on-cancel-discard flow §7.51), so it won't trigger
+        # ``on_skill_selected``. Call the slot explicitly so the
+        # middle and right panels populate with the new skill.
+        self.skill_list.select_skill(new_skill)
+        self.on_skill_selected(new_skill)
+
+        # Intentionally NOT auto-opening SKILL.md in the Editor tab
+        # post-create — the previous iteration of this flow did,
+        # which violated the right-panel's state-driven tab rule
+        # (§7.26): Editor/Preview tabs should be visible iff a
+        # *file* is selected in the middle file tree. Auto-open
+        # bypassed the file tree and pushed Editor content into the
+        # right panel without anything in the file tree showing as
+        # active — confusing visual state. Now the post-create view
+        # is identical to a normal "user just clicked a skill in
+        # the left panel" view: file tree populated, Description tab
+        # rendering the new SKILL.md template. To start editing, the
+        # user clicks SKILL.md in the file tree — one extra click,
+        # no invariant break.
+
+        # Modal acknowledgment of the successful creation. Replaces
+        # an earlier status-bar flash — a 5-second transient is too
+        # easy to miss, and a creation event is a meaningful enough
+        # action that an explicit "click to dismiss" gesture is
+        # appropriate. ``QMessageBox.information`` (not ``warning``)
+        # because nothing went wrong: the icon signals success.
+        QMessageBox.information(
+            self,
+            "Skill created",
+            f"The {new_skill.type.value.lower()} skill "
+            f"<b>{new_skill.name}</b> was successfully created.")
+
+    def _find_skill_by_md_path(self, md_path: Path) -> Skill | None:
+        """Locate a Skill in the live ``SkillListPanel`` by its
+        ``skill_md_path``. Returns None if the path isn't present
+        in the current list (e.g. filter-hidden, or the rescan
+        missed it). Cheap linear scan — skill counts are in the
+        low hundreds at worst."""
+        target = md_path.resolve()
+        for skill in self.skill_list.all_skills():
+            if (skill.skill_md_path is not None
+                    and skill.skill_md_path.resolve() == target):
+                return skill
+        return None
+
     # ----------------------------------------------------------- menu bar
     def _build_menus(self) -> None:
-        """Wire the menu bar: File / Help / View.
+        """Wire the menu bar: File / Window / Help.
 
         Action shortcuts coexist with toolbar shortcuts via
         ``ApplicationShortcut`` context where useful. ``QAction`` with
@@ -630,7 +922,12 @@ class MainWindow(QMainWindow):
 
         # ---- File ----
         file_menu = menubar.addMenu("&File")
-        act_refresh = QAction("&Refresh skills", self)
+        act_new_skill = QAction("&New Skill…", self)
+        act_new_skill.setShortcut(QKeySequence("Ctrl+N"))
+        act_new_skill.triggered.connect(self.open_new_skill_dialog)
+        file_menu.addAction(act_new_skill)
+        file_menu.addSeparator()
+        act_refresh = QAction("&Refresh Skills", self)
         act_refresh.setShortcut(QKeySequence.Refresh)  # F5
         act_refresh.triggered.connect(self.refresh)
         file_menu.addAction(act_refresh)
@@ -640,25 +937,57 @@ class MainWindow(QMainWindow):
         act_quit.triggered.connect(self.close)
         file_menu.addAction(act_quit)
 
-        # ---- View ----
+        # ---- Window ----
         # Populated lazily from ``_test_dialogs`` via
-        # ``_rebuild_view_menu``. Kept on ``self`` because we mutate
+        # ``_rebuild_window_menu``. Kept on ``self`` because we mutate
         # it on every dialog open / close. Constructed BEFORE Help so
-        # the menu bar order is File / View / Help.
-        self._view_menu = menubar.addMenu("&View")
-        self._view_menu.aboutToShow.connect(self._rebuild_view_menu)
-        self._rebuild_view_menu()
+        # the menu bar order is File / Window / Resource / Help.
+        self._window_menu = menubar.addMenu("&Window")
+        self._window_menu.aboutToShow.connect(self._rebuild_window_menu)
+        self._rebuild_window_menu()
+
+        # ---- Resource ----
+        # Populated once at startup from the packaged ``ai_tools.md``
+        # table (see ``claude_skills_manager/ai_tools.py``). The data
+        # is static for the lifetime of the process, so unlike the
+        # Window menu we don't rebuild on ``aboutToShow``.
+        self._resource_menu = menubar.addMenu("&Resource")
+        self._populate_resource_menu()
 
         # ---- Help ----
         help_menu = menubar.addMenu("&Help")
-        act_check = QAction("&Test Claude connection", self)
-        act_check.setShortcut(QKeySequence("Ctrl+T"))
+        # Ctrl+Shift+T (not Ctrl+T) — §7.69 reclaimed Ctrl+T for the
+        # frequent "Test Skill…" action on the selected skill. The
+        # connection check is rare-use enough that the extra Shift
+        # modifier is a low cost; the chord is still discoverable in
+        # the menu's right gutter.
+        act_check = QAction("&Test Claude Connection", self)
+        act_check.setShortcut(QKeySequence("Ctrl+Shift+T"))
         act_check.triggered.connect(self.open_check_claude_dialog)
         help_menu.addAction(act_check)
-        act_open_logs = QAction("&Open log folder", self)
+        # Ctrl+L = Log. Free chord (no QLineEdit / QTextEdit /
+        # QTreeWidget default claims it), mnemonic, fits the
+        # Help-menu accelerator family alongside Ctrl+Shift+T.
+        # The chord is set directly on the menu QAction (rather
+        # than via _install_shortcuts) because this entry has no
+        # right-click / context-menu parallel — the menu QAction
+        # itself is the persistent one, so there's no second
+        # QAction to collide with and no need for the §7.69
+        # ``\t<chord>`` label trick. Qt auto-renders the chord in
+        # the menu's right gutter from setShortcut.
+        act_open_logs = QAction("&Open Log Folder", self)
+        act_open_logs.setShortcut(QKeySequence("Ctrl+L"))
         act_open_logs.triggered.connect(self._open_log_folder)
         help_menu.addAction(act_open_logs)
+        # Ctrl+, — the near-universal "Preferences/Settings"
+        # chord across VS Code, macOS apps, JetBrains, browsers.
+        # Cross-app muscle memory beats any more "local" pick
+        # like Ctrl+S (which collides with editor save semantics
+        # users expect) or Ctrl+P (Print/Quick-Open elsewhere).
+        # Same direct-setShortcut pattern as Open Log Folder
+        # above — no context-menu parallel, no ambiguity risk.
         act_settings = QAction("&Settings…", self)
+        act_settings.setShortcut(QKeySequence("Ctrl+,"))
         act_settings.triggered.connect(self._open_settings_dialog)
         help_menu.addAction(act_settings)
         help_menu.addSeparator()
@@ -666,20 +995,20 @@ class MainWindow(QMainWindow):
         act_about.triggered.connect(self._open_about_dialog)
         help_menu.addAction(act_about)
 
-    def _rebuild_view_menu(self) -> None:
-        """Re-populate the View menu from the live ``_test_dialogs``
+    def _rebuild_window_menu(self) -> None:
+        """Re-populate the Window menu from the live ``_test_dialogs``
         map. Cheap (the map is small); called from every site that
         adds or removes an entry, plus ``aboutToShow`` as a backstop
         in case any path forgot to invalidate.
 
-        Each row is a custom ``_ViewMenuRow`` widget wrapped in a
+        Each row is a custom ``_WindowMenuRow`` widget wrapped in a
         ``QWidgetAction`` so the row can host two click zones: the
         title area (raises the window) and a close X button (closes
         it). The placeholder for the empty state stays a plain
         QAction — no per-row affordances to surface there."""
-        if not hasattr(self, "_view_menu"):
+        if not hasattr(self, "_window_menu"):
             return
-        self._view_menu.clear()
+        self._window_menu.clear()
         # Sort by window title so the menu order is stable and
         # readable (alphabetical by skill name).
         entries = sorted(
@@ -688,27 +1017,27 @@ class MainWindow(QMainWindow):
         )
         if not entries:
             placeholder = QAction(
-                "(no open Skill Test windows)", self._view_menu)
+                "(no open Skill Test windows)", self._window_menu)
             placeholder.setEnabled(False)
-            self._view_menu.addAction(placeholder)
+            self._window_menu.addAction(placeholder)
             return
         # Bulk "Close All" affordance at the top of the menu — hidden
         # when there's nothing open. Plain QAction (not a custom
-        # _ViewMenuRow) so the visual hierarchy makes the bulk op
+        # _WindowMenuRow) so the visual hierarchy makes the bulk op
         # distinct from the per-dialog rows below. Italicized label
         # via QAction.setFont is overkill — the separator already
         # signals the boundary.
         act_close_all = QAction(
-            f"Close All ({len(entries)})", self._view_menu)
+            f"Close All ({len(entries)})", self._window_menu)
         act_close_all.setToolTip(
             "Close every open Skill Test window. Each dialog's own "
             "cancel-on-close logic runs (in-flight `claude` runs are "
             "killed); no test data is persisted across closes.")
         act_close_all.triggered.connect(self._close_all_test_dialogs)
-        self._view_menu.addAction(act_close_all)
-        self._view_menu.addSeparator()
+        self._window_menu.addAction(act_close_all)
+        self._window_menu.addSeparator()
         for _, dialog in entries:
-            row = _ViewMenuRow(dialog.windowTitle())
+            row = _WindowMenuRow(dialog.windowTitle())
             # Default-argument captures the dialog by value at
             # connection time, sidestepping Python's late-binding
             # closure semantics in the for-loop.
@@ -717,21 +1046,21 @@ class MainWindow(QMainWindow):
             row.close_requested.connect(
                 lambda d=dialog: self._close_dialog_from_menu(d))
 
-            action = QWidgetAction(self._view_menu)
+            action = QWidgetAction(self._window_menu)
             action.setDefaultWidget(row)
-            self._view_menu.addAction(action)
+            self._window_menu.addAction(action)
 
     def _raise_dialog_from_menu(self, dialog) -> None:
         """Raise the dialog AND dismiss the menu. QWidgetAction
         widgets don't auto-close their parent menu on click, so we
         close it explicitly — otherwise the menu lingers above the
         window the user just asked to see."""
-        self._view_menu.close()
+        self._window_menu.close()
         self._raise_dialog(dialog)
 
     def _close_all_test_dialogs(self) -> None:
         """Close every open Test Skill dialog. Triggered from the
-        View menu's "Close All" entry.
+        Window menu's "Close All" entry.
 
         Snapshot the values list before iterating — each
         ``dialog.close()`` triggers ``WA_DeleteOnClose`` →
@@ -746,17 +1075,17 @@ class MainWindow(QMainWindow):
         session ids live on disk in Claude's own state, not in the
         dialog). The bulk gesture maps 1:1 onto clicking X on each
         dialog individually."""
-        self._view_menu.close()
+        self._window_menu.close()
         for dialog in list(self._test_dialogs.values()):
             dialog.close()
 
     def _close_dialog_from_menu(self, dialog) -> None:
         """Close the dialog AND dismiss the menu. ``dialog.close()``
         triggers ``WA_DeleteOnClose`` → emits ``closed`` →
-        ``_on_test_dialog_closed`` → ``_rebuild_view_menu``, so the
-        row will be gone the next time the user opens View. No
+        ``_on_test_dialog_closed`` → ``_rebuild_window_menu``, so the
+        row will be gone the next time the user opens Window. No
         manual map maintenance needed here."""
-        self._view_menu.close()
+        self._window_menu.close()
         dialog.close()
 
     @staticmethod
@@ -783,6 +1112,50 @@ class MainWindow(QMainWindow):
     def _open_settings_dialog(self) -> None:
         SettingsDialog(self).exec()
 
+    def _populate_resource_menu(self) -> None:
+        """Rebuild the Resource menu from the packaged ``ai_tools.md``
+        table. Called at startup and after Edit Resource… commits a
+        save (so the rebuild path is reused, not duplicated).
+
+        Layout: pinned "Edit Resource…" at the top, separator, then
+        one QAction per parsed AITool. Empty list → no dynamic
+        entries, but Edit Resource… stays available so the user can
+        still add the first row."""
+        tools = load_ai_tools()
+        self._resource_menu.clear()
+
+        edit_action = QAction("&Edit Resource…", self)
+        edit_action.triggered.connect(self._open_edit_resource_dialog)
+        self._resource_menu.addAction(edit_action)
+        self._resource_menu.addSeparator()
+
+        if not tools:
+            placeholder = QAction("(no resources available)", self._resource_menu)
+            placeholder.setEnabled(False)
+            self._resource_menu.addAction(placeholder)
+            return
+        for tool in tools:
+            act = QAction(tool.name, self)
+            # ``t=tool`` freezes the binding at iteration time —
+            # without it, Python's late closure binding would have
+            # every entry open the dialog for the *last* tool.
+            act.triggered.connect(
+                lambda _checked=False, t=tool: self._open_ai_tool_dialog(t))
+            self._resource_menu.addAction(act)
+
+    def _open_ai_tool_dialog(self, tool: AITool) -> None:
+        AIToolDialog(tool, self).exec()
+
+    def _open_edit_resource_dialog(self) -> None:
+        """Open the modal CRUD editor. Always refresh the Resource
+        menu when the dialog closes — Save no longer accepts the
+        dialog (it persists in-place so the user can keep editing),
+        so the old ``if exec() == Accepted`` guard would never fire.
+        Reading the file is cheap and idempotent, so unconditional
+        refresh is the simplest correct behaviour."""
+        EditResourceDialog(self).exec()
+        self._populate_resource_menu()
+
     def _open_about_dialog(self) -> None:
         AboutDialog(self).exec()
 
@@ -797,7 +1170,7 @@ class MainWindow(QMainWindow):
         opened = QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
         if not opened:
             QMessageBox.information(
-                self, "Open log folder",
+                self, "Open Log Folder",
                 f"Log file: {log_path}\n\nCouldn't open the folder "
                 f"automatically. The path above is the location.")
 
@@ -832,13 +1205,18 @@ class MainWindow(QMainWindow):
 
     def _on_state_change_requested(self, skill: Skill, new_state: str) -> None:
         """Persist a skill enable/disable toggle and refresh the affected
-        UI rows in place — no full rescan needed for a one-skill change."""
+        UI rows in place — no full rescan needed for a one-skill change.
+
+        Plugin skills land in ``~/.claude/settings.local.json`` via the
+        same ``write_override`` call (see §7.63); the only difference
+        from Global/Project is the scope, computed by
+        ``_scope_dir_for``."""
         scope_dir = self._scope_dir_for(skill)
         if scope_dir is None:
             QMessageBox.warning(
                 self, "Cannot toggle",
-                "Plugin skills can't be toggled individually — use /plugin in "
-                "Claude Code to disable the whole plugin.")
+                f"Couldn't determine the settings scope for "
+                f"{skill.name!r}. Try restarting the app.")
             return
         # Write None for "on" so the entry is removed (absent == default = on),
         # keeping settings.local.json minimal as the /skills menu does.
@@ -850,7 +1228,14 @@ class MainWindow(QMainWindow):
                 self, "Couldn't update settings",
                 f"Failed to update {scope_dir / 'settings.local.json'}:\n\n{e}")
             return
-        skill.state = new_state
+        # The override layer always reflects the user's click. The
+        # composed `state` only mirrors the override when the plugin
+        # layer isn't already overriding visibility — for plugin-off
+        # rows the composed state stays "plugin-off" because the
+        # parent plugin still gates the skill in Claude Code.
+        skill.override_state = new_state
+        if skill.state != STATE_PLUGIN_OFF:
+            skill.state = new_state
         self.skill_list.refresh_state(skill)
         if (self._current_skill is not None
                 and self._current_skill.path == skill.path):
@@ -947,11 +1332,212 @@ class MainWindow(QMainWindow):
         # MainWindow.refresh()'s per-panel clear() orchestration.
         self.refresh()
 
+    def _on_skill_drop(
+        self, source: Skill, target_type: SkillType,
+    ) -> None:
+        """Handle a drag-drop of a Project skill onto the Global header
+        (§7.66). Confirm Copy / Move / Cancel, then dispatch to
+        :mod:`skill_relocate`.
+
+        UI gating already restricts this to Project → Global at the
+        widget layer (drag flag set only on Project rows, drop flag
+        set only on Global header). The guards here defend against a
+        future caller emitting the signal directly with disallowed
+        combinations, mirroring the
+        :meth:`_on_delete_skill_requested` defensive Plugin check
+        pattern."""
+        if source.type == SkillType.PLUGIN:
+            QMessageBox.warning(
+                self, "Cannot relocate",
+                "Plugin skills can't be relocated from this GUI — they "
+                "are upstream artifacts managed via /plugin in Claude "
+                "Code.")
+            return
+        if target_type == SkillType.PLUGIN:
+            QMessageBox.warning(
+                self, "Cannot relocate",
+                "Plugin scope is upstream-only. Plugins are installed "
+                "via /plugin in Claude Code.")
+            return
+
+        # Resolve destination first. ``resolve_destination`` does the
+        # same scope-dir computation as the mutating helpers but
+        # without touching disk, so we can pre-check collisions and
+        # render From / To in the confirmation dialog with the real
+        # destination path.
+        try:
+            destination = resolve_destination(
+                source, target_type,
+                project_root=self._project_root,
+                home=None,
+            )
+        except ValueError as exc:
+            QMessageBox.critical(
+                self, "Cannot relocate",
+                f"Couldn't compute the destination: {exc}")
+            return
+
+        # Pre-confirmation collision check (§7.66 Polish step). If a
+        # skill of the same folder name already lives in Global, the
+        # mutation would fail at the copytree step anyway — surfacing
+        # the failure as a clean upfront error is more useful than
+        # presenting Copy / Move / Cancel buttons that all lead to
+        # the same error.
+        if destination.exists():
+            QMessageBox.critical(
+                self, "Skill already exists in Global",
+                f"A skill called <b>{source.name}</b> already exists "
+                f"in the Global scope:<br><br>"
+                f"<code>{destination}</code><br><br>"
+                "Rename or remove one of them first, then try again.")
+            return
+
+        # Close any open Test Skill dialog for the source skill — its
+        # ``_skill.path`` would go stale the moment we move/copy. The
+        # ``WA_DeleteOnClose`` flag tears down state cleanly; the user
+        # can reopen post-Refresh and the dialog will point at the
+        # new location.
+        existing_dialog = self._test_dialogs.get(source.path)
+        if existing_dialog is not None:
+            existing_dialog.close()
+
+        # Confirmation dialog. ``QMessageBox`` with three custom-named
+        # buttons matches the user's spec verbatim. Default = Cancel
+        # so Esc/Enter without reading lands on the safe action.
+        confirm = QMessageBox(self)
+        confirm.setIcon(QMessageBox.Question)
+        confirm.setWindowTitle("Move or copy skill to Global?")
+        confirm.setText(
+            f"Relocate skill <b>{source.name}</b> to Global?")
+        confirm.setInformativeText(
+            f"<span style='color:#555;'>From:</span> "
+            f"<code>{source.path}</code><br>"
+            f"<span style='color:#555;'>To:</span> "
+            f"<code>{destination}</code><br><br>"
+            "<b>Copy</b> leaves the Project skill in place.<br>"
+            "<b>Move</b> sends the Project skill to the Recycle Bin "
+            "after copying.")
+        copy_btn = confirm.addButton("Copy", QMessageBox.AcceptRole)
+        move_btn = confirm.addButton("Move", QMessageBox.AcceptRole)
+        cancel_btn = confirm.addButton("Cancel", QMessageBox.RejectRole)
+        confirm.setDefaultButton(cancel_btn)
+        confirm.exec()
+        clicked = confirm.clickedButton()
+        if clicked is cancel_btn or clicked is None:
+            return
+
+        # Dispatch to skill_relocate. Both copy_skill and move_skill
+        # share the same RelocationCollision / OSError failure surface
+        # so the handlers funnel through one try/except. move_skill
+        # additionally raises PartialMoveError when copy succeeds but
+        # the source removal fails — surfaced as a "demoted to Copy"
+        # message rather than a hard failure.
+        try:
+            if clicked is copy_btn:
+                new_path = copy_skill(
+                    source, target_type,
+                    project_root=self._project_root,
+                )
+                verb = "Copied"
+            else:
+                new_path = move_skill(
+                    source, target_type,
+                    project_root=self._project_root,
+                )
+                verb = "Moved"
+        except RelocationCollision as exc:
+            # Race against an external creator between our existence
+            # check above and the actual copytree. Rare in practice
+            # but the cleanest surface is a fresh error dialog
+            # repeating the collision message.
+            QMessageBox.critical(
+                self, "Skill already exists in Global", str(exc))
+            return
+        except ValueError as exc:
+            QMessageBox.critical(
+                self, "Cannot relocate", str(exc))
+            return
+        except PartialMoveError as exc:
+            # Copy succeeded; source recycle failed. The new copy is
+            # fully populated and the persisted session id has been
+            # migrated. Tell the user the Move was demoted to a Copy
+            # and they'll need to remove the source manually.
+            QMessageBox.warning(
+                self, "Move demoted to Copy",
+                f"Skill <b>{source.name}</b> was copied to Global, "
+                f"but the original Project copy at "
+                f"<code>{exc.source_path}</code> couldn't be moved "
+                f"to the Recycle Bin:<br><br>"
+                f"<code>{exc.cause}</code><br><br>"
+                "Please remove the original manually.")
+            # Still rescan — the new copy is real and the user should
+            # see it. Select-by-md-path will land on the new Global
+            # entry post-refresh.
+            self.refresh()
+            self._select_skill_at_path(exc.new_path)
+            return
+        except OSError as exc:
+            QMessageBox.critical(
+                self, "Couldn't relocate skill",
+                f"Failed to relocate <b>{source.name}</b>:<br><br>"
+                f"<code>{exc}</code>")
+            return
+
+        self.statusBar().showMessage(
+            f"{verb} {source.name} to Global", 4000)
+        self.refresh()
+        # Re-select the relocated skill in its new Global location so
+        # the user has visual confirmation. For Copy, two rows now
+        # share the name (Project + Global); selecting the new Global
+        # entry matches the user's just-completed gesture.
+        self._select_skill_at_path(new_path)
+
+    def _select_skill_at_path(self, path: Path) -> None:
+        """Find the post-refresh Skill whose folder path equals
+        ``path``, visually select it, AND populate the middle/right
+        panels with its contents. No-op if no match (skill was
+        filtered out by the current type/state checkboxes or the
+        search box — selection clears silently).
+
+        ``select_skill`` alone only updates the highlight — it
+        intentionally suppresses ``skill_selected`` so it can serve
+        as the "restore highlight after rejected switch" primitive.
+        For the drag-drop completion path (§7.66) we WANT the
+        panels to populate, so we follow up with an explicit
+        :meth:`on_skill_selected` call — same effect as if the
+        user had clicked the row directly.
+
+        Mirrors the existing :meth:`_find_skill_by_md_path` shape
+        but keyed on the folder path rather than the SKILL.md
+        path, which is what :mod:`skill_relocate` returns from its
+        mutators."""
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return
+        for skill in self.skill_list.all_skills():
+            try:
+                if skill.path.resolve() == resolved:
+                    if self.skill_list.select_skill(skill):
+                        # Populate file_tree / skill_info /
+                        # editor_panel as a user click would.
+                        self.on_skill_selected(skill)
+                    return
+            except OSError:
+                continue
+
     def _scope_dir_for(self, skill: Skill) -> Path | None:
         """Return the .claude directory whose settings.local.json controls
-        this skill's overrides, or None for plugin skills (not toggleable)."""
+        this skill's overrides.
+
+        Plugin skills target ``~/.claude`` — plugin skill overrides are
+        user-global (the layer they sit on top of, ``enabledPlugins``,
+        is also user-global). Global/Project skills target the
+        ``.claude/`` folder above their own ``skills/`` directory
+        (``skill.path.parents[1]``). This must mirror the read scope in
+        ``SkillScanner._populate_states`` — see §7.15 and §7.63."""
         if skill.type == SkillType.PLUGIN:
-            return None
+            return Path.home() / ".claude"
         # Skill paths look like <scope>/.claude/skills/<name>/, so parents[1]
         # is the .claude folder for both Global and Project skills.
         try:

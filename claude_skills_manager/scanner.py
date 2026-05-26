@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from .models import Skill, SkillType
 from .skill_md import parse_skill_md
@@ -47,17 +47,76 @@ class SkillScanner:
 
     def __init__(self, home: Path | None = None) -> None:
         self.home = (home or Path.home()).expanduser()
+        # Optional event-loop pump callback. Stashed here for the
+        # duration of one ``scan_all`` call (set on entry, cleared in
+        # ``finally``) so internal helpers can call ``self._tick()``
+        # without each one needing a new kwarg in its signature.
+        # ``None`` means "no pump" — the existing pure-Python scan
+        # path with no event-loop concerns.
+        self._on_progress: Callable[[], None] | None = None
 
     # ------------------------------------------------------------------ public
-    def scan_all(self, project_root: Path | None = None) -> list[Skill]:
-        skills: list[Skill] = []
-        skills.extend(self.scan_global())
-        skills.extend(self.scan_plugin())
-        if project_root is not None:
-            skills.extend(self.scan_project(project_root))
-        skills = _dedupe(skills)
-        self._populate_states(skills)
-        return skills
+    def scan_all(
+        self,
+        project_root: Path | None = None,
+        *,
+        on_progress: Callable[[], None] | None = None,
+    ) -> list[Skill]:
+        """Discover skills from all three sources.
+
+        ``on_progress`` (keyword-only) is an optional zero-arg
+        callable invoked between phases and inside the hot
+        ``os.walk`` loop of :meth:`_find_project_skills_dirs`. Used
+        by the splash window during launch to pump
+        ``QApplication.processEvents`` so the marquee progress bar
+        animates while this otherwise-synchronous scan runs (the
+        main thread is blocked here, so Qt's animation tick can't
+        fire without periodic yields). Default ``None`` keeps the
+        scanner Qt-free in spirit — the callback is opaque, no
+        PySide6 import here.
+
+        Refresh / F5 paths intentionally call this with the default
+        ``None``: the busy-bar marquee on the status bar shares the
+        same animation issue, but pumping events while MainWindow is
+        visible would also process queued user input mid-scan, which
+        the sync-refresh contract doesn't currently handle. Scoping
+        the pump to the launch path only is the conservative call."""
+        self._on_progress = on_progress
+        try:
+            skills: list[Skill] = []
+            skills.extend(self.scan_global())
+            self._tick()
+            skills.extend(self.scan_plugin())
+            self._tick()
+            if project_root is not None:
+                skills.extend(self.scan_project(project_root))
+            self._tick()
+            skills = _dedupe(skills)
+            self._populate_states(skills)
+            self._tick()
+            return skills
+        finally:
+            # Clear so a stashed callback can't outlive the scan
+            # (e.g., GC the splash widget, then a later scan still
+            # holds a dead reference). Also defends against an
+            # exception inside the scan leaving stale state on self.
+            self._on_progress = None
+
+    def _tick(self) -> None:
+        """Invoke the optional progress callback once. No-op when
+        no callback is configured.
+
+        Defensive ``try/except`` because the callback originates
+        outside the scanner — a bug or oddity there shouldn't be
+        able to abort a scan that's already mid-flight. Pump
+        callbacks are a UX nicety; correctness of the result list
+        is the priority."""
+        if self._on_progress is None:
+            return
+        try:
+            self._on_progress()
+        except Exception:
+            pass
 
     def scan_global(self) -> list[Skill]:
         return self._scan_skill_holder(
@@ -163,46 +222,78 @@ class SkillScanner:
         ``idm_docs_plugin/`` for ``idm-docs-plugin``), and re-deriving
         would mis-match against ``enabledPlugins``.
 
-        Scope derivation for Global/Project skills must match the write
-        side (see ``MainWindow._scope_dir_for`` and
-        ``skill_settings.write_override``). Each skill's overrides come
-        from the ``.claude/`` folder *containing its own skills/
-        directory* — i.e., ``skill.path.parents[1]`` — not from a global
-        project root. Without this, a project_root pointed at a monorepo
-        parent (e.g. ``C:\\projects``) reads ``C:\\projects\\.claude\\``
-        while writes go to ``C:\\projects\\<project>\\.claude\\``, so
-        toggles silently disappear on Refresh.
+        State composition (§7.63):
+
+        * Global / Project: ``skillOverrides[name]`` from the skill's
+          own ``.claude/`` scope (``skill.path.parents[1]``), default
+          ``on``.
+        * Plugin: two-layer composition. The plugin layer
+          (``enabledPlugins[plugin_id]``) gates everything — if the
+          plugin is disabled, the skill is ``plugin-off`` regardless of
+          any per-skill override. If the plugin is enabled, the
+          per-skill override from ``~/.claude/skillOverrides[name]``
+          applies (default ``on``). Plugin skill overrides live in the
+          user-global ``.claude`` scope rather than per-skill (plugin
+          skills don't have an enclosing project root, and the override
+          conceptually layers on top of the user-global plugin
+          enablement).
+
+        Scope derivation must match the write side (see
+        ``MainWindow._scope_dir_for`` and
+        ``skill_settings.write_override``). Mismatched read/write
+        scopes silently lose toggles on Refresh — see §7.15.
 
         Reads are cached by scope so each settings file is hit once per
         scan even when many skills share a folder."""
         enabled_plugins = read_enabled_plugins(self.home)
         overrides_cache: dict[Path, dict[str, str]] = {}
+        plugin_scope = self.home / ".claude"
 
         def overrides_for(skill: Skill) -> dict[str, str]:
-            try:
-                scope = skill.path.parents[1]
-            except IndexError:
-                return {}
+            if skill.type == SkillType.PLUGIN:
+                scope: Path | None = plugin_scope
+            else:
+                try:
+                    scope = skill.path.parents[1]
+                except IndexError:
+                    return {}
             if scope not in overrides_cache:
                 overrides_cache[scope] = read_overrides(scope)
             return overrides_cache[scope]
 
         for s in skills:
+            # override_state carries the raw skillOverrides value (or the
+            # absence-default "on") for every skill type. It's the layer
+            # the GUI's Enable/Disable toggle writes to, regardless of
+            # plugin enablement above it.
+            s.override_state = overrides_for(s).get(s.name, STATE_ON)
             if s.type == SkillType.PLUGIN:
-                if s.plugin_id and enabled_plugins.get(s.plugin_id, False):
-                    s.state = STATE_ON
-                else:
+                plugin_on = bool(s.plugin_id) and enabled_plugins.get(
+                    s.plugin_id, False)
+                if not plugin_on:
+                    # Plugin layer gates visibility — render plugin-off so
+                    # the user sees the truth in Claude Code's behavior,
+                    # but the override on disk is preserved on
+                    # override_state so the toggle keeps working and will
+                    # take effect once the plugin is re-enabled.
                     s.state = STATE_PLUGIN_OFF
-            else:
-                # Global and Project both: each skill's overrides live in
-                # the .claude/ folder above its skills/ directory — same
-                # path the write side targets via skill.path.parents[1].
-                s.state = overrides_for(s).get(s.name, STATE_ON)
+                    continue
+            s.state = s.override_state
 
     def _find_project_skills_dirs(self, root: Path) -> Iterator[Path]:
         """Walk the tree looking for any '.claude/skills' directory."""
         base_depth = str(root).count(os.sep)
+        # ``walked_dirs`` counts every iteration of os.walk (including
+        # pruned / ignored ones, since the tick is about wall time not
+        # productive work). The mod-50 cadence is the sweet spot from
+        # the §7.62 plan: enough ticks to keep a 30-60 fps marquee
+        # alive on a typical scan (~hundreds to low thousands of dirs)
+        # without flooding processEvents on the deep-tree case.
+        walked_dirs = 0
         for dirpath, dirnames, _filenames in os.walk(root):
+            walked_dirs += 1
+            if walked_dirs % 50 == 0:
+                self._tick()
             depth = dirpath.count(os.sep) - base_depth
             if depth > MAX_SCAN_DEPTH:
                 dirnames[:] = []

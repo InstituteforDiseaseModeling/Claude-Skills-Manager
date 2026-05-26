@@ -40,12 +40,13 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import (
-    QAction, QFont, QKeySequence, QShortcut, QTextCursor,
+    QAction, QFont, QKeySequence, QShortcut, QTextCursor, QTextOption,
 )
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QDialog, QFileDialog, QHBoxLayout, QLabel,
-    QLineEdit, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
-    QSplitter, QStyle, QTabWidget, QTextBrowser, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QDialog, QFileDialog,
+    QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
+    QProgressBar, QPushButton, QSplitter, QStyle, QTabWidget,
+    QTextBrowser, QVBoxLayout, QWidget,
 )
 
 
@@ -74,8 +75,7 @@ from ..models import Skill, SkillType
 from ..skill_introspect import (
     CLAUDE_EXECUTABLE, build_claude_command, claude_env_overrides,
     claude_path_diagnostic, extract_summary,
-    find_claude_executable, parse_claude_json_envelope,
-    read_skill_md_text,
+    find_claude_executable, read_skill_md_text,
 )
 from ..skill_md import (
     estimated_token_count, parse_skill_md_text, strip_frontmatter,
@@ -175,12 +175,30 @@ class TestSkillDialog(QDialog):
     #     Payload: human-readable error string.
     _worker_result = Signal(int, str, str)
     _worker_failed = Signal(str)
+    # One emission per stream-json event line (§7.60). Payload is the
+    # raw JSON text; the GUI slot parses it and dispatches by
+    # ``type``. Queued connection auto-routes from the worker thread
+    # to the GUI thread, same as the result/failed signals above —
+    # but emission frequency is much higher (potentially tens per
+    # second on tool-heavy runs), so the slot must be cheap.
+    _worker_stream_event = Signal(str)
 
     # Stable tab indices — match the build order in `_build_ui`.
     # Description / Raw SKILL.md / Claude.
     _DESCRIPTION_TAB = 0
     _RAW_TAB = 1
     _TEST_TAB = 2
+
+    # Stable inner-tab indices for the Run section's nested QTabWidget
+    # (§7.44 + §7.60). Order is Response, Activity, Raw Output —
+    # Response is the headline result and stays at index 0 so the
+    # default tab on dialog open is unchanged; Activity is sandwiched
+    # in the middle because it's "narrative", not "raw", and
+    # surfacing it next to Response makes it discoverable; Raw Output
+    # stays in its historical position-of-last-resort.
+    _SUB_RESPONSE = 0
+    _SUB_ACTIVITY = 1
+    _SUB_RAW = 2
 
     def __init__(self, skill: Skill, parent: QWidget | None = None) -> None:
         # Pass parent so the dialog inherits the main window's
@@ -244,22 +262,82 @@ class TestSkillDialog(QDialog):
         # Set true when the timeout fires, so ``_on_finished`` can
         # label the result correctly. Parallel to ``_was_cancelled``.
         self._timed_out = False
-        # Multi-turn conversation state (§7.46). ``_session_id`` is the
-        # id Claude Code returned in the previous successful
-        # JSON-envelope run; the next Run with the "Continue
-        # conversation" checkbox ticked passes it back as
-        # ``--resume <id>`` so claude restores the prior context. None
-        # means "no captured session yet" — the next run starts fresh.
-        # Survives toggling the checkbox (intentional — flipping the
-        # box off then on resumes from where you left off). Cleared
-        # only by the Clear button and by closing the dialog.
+        # Effective hard-timeout for the *current* run (§7.59).
+        # Snapshotted from settings at ``_on_run`` start and used by
+        # ``_on_tick`` for the countdown display and by the TIMED OUT
+        # verdict. The +30s / +60s / +5m extend buttons mutate this
+        # value mid-run and re-start ``_timeout_timer`` with the new
+        # remaining slice — but never write back to QSettings, so the
+        # next Run (and the next dialog open) reads the user's
+        # persisted Help → Settings… value unchanged.
+        self._current_timeout_ms = 0
+        # Multi-turn conversation state (§7.46 + §7.68). ``_session_id``
+        # is the id Claude Code returned in the previous successful Run
+        # within THIS dialog window; the next Run passes it back as
+        # ``--resume <id>`` so claude restores the prior context.
+        # Continue-mode is unconditional (the checkbox was removed),
+        # so the id is consulted on every Run automatically — empty/
+        # None means "no captured session yet" and the next Run starts
+        # fresh.
+        #
+        # Lifetime: in-memory only, scoped to this dialog instance
+        # (§7.68 reverses the §7.65 / §7.67 QSettings persistence).
+        # WA_DeleteOnClose drops the state on dialog close, so every
+        # fresh open of the Test Skill window starts a brand new
+        # conversation — the user-stated semantic that supersedes the
+        # earlier "remember across opens" design. Multi-turn within
+        # one window is preserved (Run → capture → next Run continues).
+        #
+        # ``_session_cwd`` records the cwd at which the current
+        # ``_session_id`` was captured. The Run boundary compares it
+        # against the current ``self._cwd`` and drops the session if
+        # they differ — Claude CLI scopes conversation history to the
+        # cwd's project slug, so a session captured under cwd_A is
+        # not resumable under cwd_B. Action-boundary check (no event
+        # wiring on Browse / typing) keeps the composition with
+        # §7.48's Working Directory control clean.
         self._session_id: str | None = None
-        # Snapshot of "this run is in continue mode" set at run start
-        # and read in ``_on_worker_result``. Stored on self rather
-        # than passed through signals because Qt's Signal payload
-        # surface is already busy with (exit_code, stdout, stderr) and
-        # widening it ripples through every emit site.
-        self._last_run_was_continue = False
+        self._session_cwd: Path | None = None
+        # Stream-event capture (§7.60). Stream-json is always-on for
+        # the test runner, and the GUI captures the salient bits as
+        # events fly past so ``_on_worker_result`` has a final
+        # response/session_id/usage/error verdict ready without
+        # re-parsing anything. All four are reset at the start of
+        # every Run; reading them from the result-handler before a
+        # Run has happened yields the empty/None defaults below,
+        # which the verdict paths handle as "no stream data" and
+        # fall back to raw stdout — a defensive but not load-bearing
+        # branch (a Run that finished without a result event is the
+        # crash case).
+        self._stream_response_text: str = ""
+        self._stream_session_id: str | None = None
+        self._stream_is_error: bool = False
+        self._stream_usage: dict | None = None
+        self._stream_event_count: int = 0
+        # Raw Output tab has two views (§7.61): a "pretty" CLI-style
+        # transcript (default) and the verbatim JSON stream (kept
+        # available for the schema-tolerant debug affordance from
+        # §7.60 — never crash on unknown event shapes, but also: let
+        # the user *see* the unknown shapes). Each is maintained as
+        # a shadow string so flipping the toggle is just a setPlainText
+        # off the active buffer. ``_append_raw_buf`` / ``_append_pretty_buf``
+        # / ``_append_both`` keep the buffers and the visible widget
+        # in sync; ``_on_raw_view_mode_changed`` handles the swap.
+        # Non-event lines (preface, stderr, verdict, [timeout extended])
+        # land in both buffers verbatim — those *are* the CLI-style
+        # presentation already, so there's nothing to reformat.
+        self._raw_buffer_text: str = ""
+        self._pretty_buffer_text: str = ""
+        self._raw_view_mode: str = "pretty"
+        # Per-run state for tool_use → tool_result correlation in the
+        # pretty formatter. Stream-json emits these as separate events
+        # in order, so we stash the most-recent tool name when we see
+        # a ``tool_use`` block and consume it on the next ``tool_result``
+        # — turns the result line into ``  ⎿ Glob returned 839 chars``
+        # instead of a bare ``  ⎿ (839 chars)`` with no tool context.
+        # Reset in ``_clear_run_views`` alongside the other ``_stream_*``
+        # captures.
+        self._stream_last_tool_name: str = ""
         # Working directory for the ``claude`` subprocess (§7.48).
         # Defaults to the app's launch directory (``os.getcwd()`` at
         # dialog construction), which exactly preserves the pre-§7.48
@@ -322,6 +400,7 @@ class TestSkillDialog(QDialog):
         # possibly emit.
         self._worker_result.connect(self._on_worker_result)
         self._worker_failed.connect(self._on_worker_failed)
+        self._worker_stream_event.connect(self._on_stream_event)
 
         self._build_ui()
         self._wire_shortcuts()
@@ -482,23 +561,30 @@ class TestSkillDialog(QDialog):
         # Working Directory row (§7.48). Sits above the prompt
         # header so it reads as a per-window setting that governs
         # every Run, not as something tied to one specific prompt.
-        # Layout: label + read-only path display + Browse button.
-        # Read-only display (instead of an editable QLineEdit) so the
-        # user can't paste a malformed path that wouldn't survive
-        # QFileDialog's "must exist" guarantee — and so the only
-        # mutation path is the Browse button, which keeps the value
-        # in lock-step with an actual directory on disk.
+        # Layout: label + editable path field + Browse button.
+        # Field is editable: typing is a valid mutation path
+        # alongside Browse, and a ``textChanged`` listener keeps
+        # ``self._cwd`` in sync on every keystroke. Trade-off: the
+        # user can type a malformed / non-existent path that
+        # ``QFileDialog`` would have rejected. Validation moves
+        # to the Run boundary — Popen raises on a missing cwd and
+        # the existing ``_on_worker_failed`` path surfaces the
+        # error message cleanly. Same idiom as a shell ``cd``.
         cwd_row = QHBoxLayout()
         self._cwd_label = QLabel("Working Directory:")
         cwd_row.addWidget(self._cwd_label)
         self.cwd_display = QLineEdit(str(self._cwd))
-        self.cwd_display.setReadOnly(True)
         self.cwd_display.setToolTip(
             "Directory `claude` will be invoked from for every Run "
             "in this window. Affects which project memory file "
             "(~/.claude/projects/<slug>/memory/MEMORY.md) and which "
             "project-local settings (.claude/settings.local.json) the "
-            "subprocess loads. Click Browse to change.")
+            "subprocess loads. Type a path or click Browse to change.")
+        # Live sync: every keystroke updates ``self._cwd`` so the
+        # next Run uses whatever's currently in the field. Browse
+        # also calls ``setText`` which routes through here; the
+        # handler's equality short-circuit makes that a no-op.
+        self.cwd_display.textChanged.connect(self._on_cwd_text_changed)
         # Monospace for paths — same convention used by the dialog's
         # header strip and the Raw Output pane.
         cwd_font = QFont("Consolas")
@@ -551,7 +637,6 @@ class TestSkillDialog(QDialog):
         trust_row.addWidget(self._trust_label)
         self.trust_dir_display = QLineEdit(
             str(self._trust_dir) if self._trust_dir else "")
-        self.trust_dir_display.setReadOnly(True)
         self.trust_dir_display.setPlaceholderText(
             "(none — Read scoped to working directory)")
         self.trust_dir_display.setToolTip(
@@ -559,21 +644,21 @@ class TestSkillDialog(QDialog):
             "every Run in this window (passed as --add-dir). "
             "Pre-populated with the selected skill's folder so prompts "
             "that reference SKILL.md by absolute path can read it. "
-            "Click the × inside the field to limit Read to the working "
-            "directory; click Browse to pick a different directory.")
+            "Type a path, click Browse to pick a directory, or click "
+            "the × to limit Read to the working directory only.")
         self.trust_dir_display.setFont(cwd_font)
         self.trust_dir_display.textChanged.connect(
             self._on_trust_dir_text_changed)
-        # Inline clear "×" — custom action, NOT Qt's built-in
-        # ``setClearButtonEnabled``. Qt's built-in action is internally
-        # gated by ``!isReadOnly()`` (see
-        # ``QLineEditPrivate::updateClearButton``), so on a read-only
-        # field the icon renders but the click is a no-op. Adding our
-        # own action at ``TrailingPosition`` bypasses that gate: we
-        # own the action's enabled/visible state, and the slot calls
-        # ``QLineEdit.clear()`` which is not read-only-gated. Same
-        # icon (``SP_LineEditClearButton``) as the built-in for visual
-        # parity.
+        # Inline clear "×" — kept as a custom action rather than
+        # Qt's built-in ``setClearButtonEnabled`` so we can give it
+        # an explicit tooltip ("Clear Trust Directory…") that names
+        # what's being cleared and what the next-Run consequence is.
+        # The built-in shows the same glyph but offers no hover
+        # explanation. Historical note: this field used to be
+        # read-only, which would have *required* a custom action
+        # anyway (Qt's built-in is gated by ``!isReadOnly()``); now
+        # that the field accepts typing, the custom action is a
+        # stylistic preference rather than a workaround.
         self._trust_clear_action = QAction(
             self.style().standardIcon(QStyle.SP_LineEditClearButton),
             "Clear Trust Directory",
@@ -601,7 +686,7 @@ class TestSkillDialog(QDialog):
         self.trust_dir_browse_btn.setToolTip(
             "Pick a directory to grant `claude` Read access on for "
             "runs in this window. Translates to a --add-dir flag at "
-            "Run time. Skipped when 'Skip permission prompts' is "
+            "Run time. Skipped when 'Skip Permission Prompts' is "
             "checked — that flag bypasses the Read gate entirely, "
             "making --add-dir redundant.")
         self.trust_dir_browse_btn.clicked.connect(
@@ -629,42 +714,17 @@ class TestSkillDialog(QDialog):
         self._cwd_label.setFixedWidth(_row_label_width)
         self._trust_label.setFixedWidth(_row_label_width)
 
-        # Header row: "Prompt:" label + session indicator (left of
-        # the checkboxes when active) + Continue conversation +
-        # Prefix Skill Name. The checkboxes sit on the same line as
+        # Header row: "Prompt:" label + Prefix Skill Name + Skip
+        # Permission Prompts. The checkboxes sit on the same line as
         # the label so the relationship to the prompt below is
-        # unambiguous (vs. floating them elsewhere).
+        # unambiguous (vs. floating them elsewhere). No session
+        # indicator: continue-mode is unconditional and the id is
+        # persisted silently in QSettings (§7.46) — the user doesn't
+        # need to see it, and surfacing an opaque 8-char id was more
+        # visual noise than payoff.
         prompt_header = QHBoxLayout()
         prompt_header.addWidget(QLabel("Prompt:"))
         prompt_header.addStretch(1)
-        # Session indicator — empty until a continue-mode run captures
-        # a session id. Faded so it doesn't compete visually with the
-        # active controls.
-        self.session_label = QLabel("")
-        self.session_label.setStyleSheet("color:#888; font-size:9pt;")
-        self.session_label.setToolTip(
-            "Active Claude conversation id. Shown when a Continue-"
-            "conversation run has captured a session — the next Run "
-            "with the checkbox ticked will resume from here.")
-        prompt_header.addWidget(self.session_label)
-        # Continue-conversation toggle (§7.46). Checked by default —
-        # multi-turn context is the strongly-expected behavior for a
-        # window where users naturally ask follow-up prompts ("now
-        # expand on point 2", "what about X"); the cost of a stray
-        # JSON envelope parse on a one-shot run is far smaller than
-        # the cost of every follow-up forgetting the conversation.
-        # When checked, the next Run includes --resume <session-id>
-        # (if we have one) and switches to --output-format json so we
-        # can capture the session id from the envelope for subsequent
-        # turns.
-        self.continue_checkbox = QCheckBox("Continue conversation")
-        self.continue_checkbox.setToolTip(
-            "When checked, each Run continues the previous run's "
-            "session so Claude remembers context across turns. "
-            "Uncheck (or click Clear) to start a fresh conversation. "
-            "The session id appears on the left once captured.")
-        self.continue_checkbox.setChecked(True)
-        prompt_header.addWidget(self.continue_checkbox)
         self.prefix_checkbox = QCheckBox("Prefix Skill Name")
         self.prefix_checkbox.setToolTip(
             "When checked, prepends /<skill-name> to the prompt — Claude "
@@ -683,7 +743,7 @@ class TestSkillDialog(QDialog):
         # dangerous for testing untrusted prompts. The "dangerous"
         # framing is preserved in both the label and the tooltip so
         # there's no chance the user toggles it without understanding.
-        self.skip_perms_checkbox = QCheckBox("Skip permission prompts")
+        self.skip_perms_checkbox = QCheckBox("Skip Permission Prompts")
         self.skip_perms_checkbox.setToolTip(
             "When checked, passes --dangerously-skip-permissions to "
             "`claude`. The subprocess will auto-approve EVERY tool "
@@ -764,7 +824,46 @@ class TestSkillDialog(QDialog):
         self.run_busy.setFixedSize(120, 12)
         self.run_busy.hide()
         bar.addWidget(self.run_busy)
+
+        # Stretch goes here, *before* the extend-timeout buttons, so
+        # the buttons pin to the right edge of the run bar rather
+        # than drifting with the status label's text length. Pattern:
+        # ``[left-packed widgets] [stretch] [right-anchored widgets]``.
+        # The trailing position was the source of the §7.60.x layout
+        # bug — with the stretch at the end, status_label growing
+        # pushed everything else (including the extend buttons)
+        # right by however many pixels the status text gained.
         bar.addStretch(1)
+
+        # Extend-timeout buttons (§7.59). Three fixed deltas — wide
+        # enough to cover both "claude's a little slow today, give it
+        # half a minute more" and "this is going to be a long run,
+        # buy me five minutes". Hidden when no run is in progress;
+        # show/hide pairs with ``run_busy`` so the visual cluster
+        # ("busy + extend") moves as one. Per-run only — clicking
+        # one mutates ``_current_timeout_ms`` and restarts the
+        # backing QTimer; QSettings is never touched, so the next
+        # Run reads the user's persisted Help → Settings… value.
+        self._extend_buttons: list[QPushButton] = []
+        for label, delta_s in (("+30s", 30), ("+60s", 60),
+                               ("+5m", 300), ("+30m", 1800)):
+            btn = QPushButton(label)
+            btn.setStyleSheet(BUTTON_STYLE)
+            btn.setToolTip(
+                f"Add {delta_s} seconds to the timeout for this run "
+                "only. Does not change the saved default in "
+                "Help → Settings…")
+            btn.hide()
+            # ``d=delta_s`` captures the value at definition time —
+            # without the default-argument idiom, Python's late-bound
+            # closures would have all three buttons fire with the
+            # last loop value (300). Same gotcha that bites
+            # ``for i in range(N): callbacks.append(lambda: f(i))``.
+            btn.clicked.connect(lambda _checked=False, d=delta_s:
+                                self._extend_timeout(d))
+            bar.addWidget(btn)
+            self._extend_buttons.append(btn)
+
         top_layout.addLayout(bar)
 
         splitter.addWidget(top)
@@ -803,8 +902,7 @@ class TestSkillDialog(QDialog):
         # the button cap aligns with the tab caption baseline; an
         # explicit setFixedHeight at the end of _build_test_tab
         # snaps any residual gap to zero.
-        self._save_as_btn = QPushButton("Save As…")
-        self._save_as_btn.setStyleSheet("""
+        _corner_btn_style = """
             QPushButton {
                 background: #f5f5f5;
                 border: 1px solid #b0b0b0;
@@ -826,16 +924,65 @@ class TestSkillDialog(QDialog):
                 color: #aaaaaa;
                 border-color: #d8d8d8;
             }
-        """)
+        """
+        # Open File… — loads an external file into whichever inner
+        # tab is currently visible:
+        #   Response → .md (rendered via setMarkdown)
+        #   Activity → .txt (rendered as plain text)
+        #   Raw Output → .txt (rendered as plain text)
+        # Same context-sensitive corner-widget rationale as Save As…;
+        # placed first because Open is a precursor action (input)
+        # while Save is a terminating action (output) — left-to-right
+        # reads as the natural I/O flow.
+        self._open_file_btn = QPushButton("Open File…")
+        self._open_file_btn.setStyleSheet(_corner_btn_style)
+        self._open_file_btn.setCursor(Qt.PointingHandCursor)
+        self._open_file_btn.clicked.connect(self._on_open_file_clicked)
+
+        self._save_as_btn = QPushButton("Save As…")
+        self._save_as_btn.setStyleSheet(_corner_btn_style)
         self._save_as_btn.setCursor(Qt.PointingHandCursor)
         self._save_as_btn.clicked.connect(self._on_save_as_clicked)
+
+        # Clear — per-tab destructive reset for the currently-visible
+        # inner sub-tab only. Distinct from ``self.clear_btn`` next to
+        # Run/Cancel (which is a wholesale "start over" — prompt +
+        # all three panes + session id). This one wipes ONLY the tab
+        # the user is looking at, leaving the other two intact. Same
+        # context-sensitive corner-widget rationale as Save As… /
+        # Open File…; placed last because Clear is the destructive
+        # action and "input → output → reset" reads naturally
+        # left-to-right.
+        self._clear_tab_btn = QPushButton("Clear")
+        self._clear_tab_btn.setStyleSheet(_corner_btn_style)
+        self._clear_tab_btn.setCursor(Qt.PointingHandCursor)
+        self._clear_tab_btn.clicked.connect(self._on_clear_tab_clicked)
+
+        # Wrap all three buttons in a container — Qt's setCornerWidget
+        # takes one widget per corner, so a thin QHBoxLayout-on-
+        # QWidget pair is the canonical way to host multiple
+        # controls in a corner slot. Margins kept at zero so the
+        # buttons align flush with the tab strip's right edge.
+        corner_host = QWidget()
+        corner_layout = QHBoxLayout(corner_host)
+        corner_layout.setContentsMargins(0, 0, 0, 0)
+        corner_layout.setSpacing(4)
+        corner_layout.addWidget(self._open_file_btn)
+        corner_layout.addWidget(self._save_as_btn)
+        corner_layout.addWidget(self._clear_tab_btn)
         self._response_tabs.setCornerWidget(
-            self._save_as_btn, Qt.TopRightCorner)
-        # Re-evaluate enabled state and tooltip whenever the user
-        # switches between Response and Raw Output — the button
-        # describes whichever tab is currently visible.
+            corner_host, Qt.TopRightCorner)
+        # Re-evaluate enabled state and tooltips whenever the user
+        # switches between Response / Activity / Raw Output — all
+        # three corner buttons describe whichever tab is currently
+        # visible. ``_update_save_btn_state`` propagates to Clear
+        # too (the two enable rules are identical: tab has content
+        # AND we aren't running), so wiring just the Save handler
+        # is enough.
         self._response_tabs.currentChanged.connect(
             self._update_save_btn_state)
+        self._response_tabs.currentChanged.connect(
+            self._update_open_btn_tooltip)
 
         # ---- Tab 1: Response (rendered markdown) ----
         # ``QTextBrowser.setMarkdown`` is the same renderer the Skill
@@ -847,9 +994,47 @@ class TestSkillDialog(QDialog):
         self.response_view.setOpenExternalLinks(True)
         self.response_view.setPlaceholderText(
             "(Rendered response will appear here when `claude` finishes)")
+        # Wrap long content rather than scroll horizontally. Two
+        # complementary settings:
+        #   - ``setWordWrapMode(WrapAtWordBoundaryOrAnywhere)``
+        #     tells the QTextEdit block layout engine that
+        #     unbreakable tokens (long URLs, dense identifiers)
+        #     can wrap mid-token rather than overflow.
+        #   - The default-style-sheet ``pre`` rule fixes fenced
+        #     code blocks: ``setMarkdown`` emits them as ``<pre>``,
+        #     which Qt renders with ``white-space: pre`` by default
+        #     (preserve whitespace, no wrap). ``pre-wrap`` keeps
+        #     the formatting indentation but allows soft-wraps at
+        #     spaces; ``break-word`` is the fallback for code
+        #     lines with no spaces (e.g., huge URLs in a code
+        #     block) so they wrap rather than push the scrollbar.
+        # Same fix shape applies anywhere ``setMarkdown`` is used
+        # with content that might contain long code lines.
+        self.response_view.setWordWrapMode(
+            QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        self.response_view.document().setDefaultStyleSheet(
+            "pre { white-space: pre-wrap; word-wrap: break-word; }")
         self._response_tabs.addTab(self.response_view, "Response")
 
-        # ---- Tab 2: Raw Output (chronological monospace) ----
+        # ---- Tab 2: Activity (live progress / steps — §7.60) ----
+        # Stream-json events from ``claude --output-format stream-json
+        # --verbose`` are parsed by ``_on_stream_event`` and appended
+        # here as a chronological narrative: session init, assistant
+        # text deltas, tool calls with their inputs, tool results
+        # with their sizes, terminal "Done" verdict with usage stats.
+        # ``QTextBrowser`` rather than ``QPlainTextEdit`` because
+        # event lines benefit from light HTML formatting (dim
+        # timestamps, bold tool names, color-coded glyphs) — same
+        # widget Family as Response, different content shape.
+        # Read-only.
+        self.activity_view = QTextBrowser()
+        self.activity_view.setOpenExternalLinks(False)
+        self.activity_view.setPlaceholderText(
+            "(Live activity — tool calls, tool results, assistant "
+            "text — will appear here as the run progresses)")
+        self._response_tabs.addTab(self.activity_view, "Activity")
+
+        # ---- Tab 3: Raw Output (chronological monospace) ----
         # The previous single-pane behavior, moved here verbatim.
         # Diagnostic preface goes here at the start of each run; raw
         # stdout, any stderr, and the verdict marker (`[done in Xs]`
@@ -862,7 +1047,40 @@ class TestSkillDialog(QDialog):
         self.raw_view.setFont(raw_font)
         self.raw_view.setPlaceholderText(
             "(Diagnostic + raw output will appear here when you click Run)")
-        self._response_tabs.addTab(self.raw_view, "Raw Output")
+
+        # Two-mode container (§7.61). The Raw Output tab carries both
+        # the CLI-style "Pretty" transcript (default) and the
+        # verbatim JSON "Raw JSON" stream; the combobox swaps the
+        # visible widget contents between the two internal buffers.
+        # The text widget itself is shared — only its content changes
+        # — so cursor / font / scroll behavior is identical across
+        # modes and the existing save / load / clear plumbing keeps
+        # working without indirection.
+        raw_container = QWidget()
+        raw_layout = QVBoxLayout(raw_container)
+        raw_layout.setContentsMargins(0, 0, 0, 0)
+        raw_layout.setSpacing(4)
+
+        raw_toolbar = QHBoxLayout()
+        raw_toolbar.setContentsMargins(6, 4, 6, 0)
+        raw_toolbar_label = QLabel("View:")
+        raw_toolbar.addWidget(raw_toolbar_label)
+        self.raw_view_mode_combo = QComboBox()
+        self.raw_view_mode_combo.addItem("Pretty (CLI-style)", "pretty")
+        self.raw_view_mode_combo.addItem("Raw JSON", "raw")
+        self.raw_view_mode_combo.setToolTip(
+            "Pretty: human-readable transcript like the Claude Code "
+            "terminal output.\n"
+            "Raw JSON: the verbatim stream-json events, one per line "
+            "— useful for debugging unfamiliar event shapes.")
+        self.raw_view_mode_combo.currentIndexChanged.connect(
+            self._on_raw_view_mode_changed)
+        raw_toolbar.addWidget(self.raw_view_mode_combo)
+        raw_toolbar.addStretch(1)
+        raw_layout.addLayout(raw_toolbar)
+        raw_layout.addWidget(self.raw_view, 1)
+
+        self._response_tabs.addTab(raw_container, "Raw Output")
 
         bottom_layout.addWidget(self._response_tabs, 1)
         splitter.addWidget(bottom)
@@ -892,13 +1110,50 @@ class TestSkillDialog(QDialog):
         bar_height = self._response_tabs.tabBar().sizeHint().height()
         if bar_height > 0:
             self._save_as_btn.setFixedHeight(bar_height)
+            self._open_file_btn.setFixedHeight(bar_height)
+            self._clear_tab_btn.setFixedHeight(bar_height)
 
-        # Initial Save As… state: both panes are empty at construct,
-        # so the button starts disabled with a "run something first"
-        # tooltip. Subsequent renders / appends / clears refresh it.
+        # Initial Save As… state: all three panes are empty at
+        # construct, so the button starts disabled with a "run
+        # something first" tooltip. Subsequent renders / appends /
+        # clears refresh it.
         self._update_save_btn_state()
+        # Open File… is always enabled when not running; seed its
+        # tooltip to describe whichever tab is current at construct.
+        self._update_open_btn_tooltip()
 
     # ---- Working-directory control -----------------------------------------
+    def _on_cwd_text_changed(self, text: str) -> None:
+        """Keep ``self._cwd`` in sync with whatever's in the Working
+        Directory field. Fires on every keystroke (typing) AND on
+        the programmatic ``setText`` from :meth:`_on_browse_cwd`.
+
+        Empty / whitespace-only text is treated as "user is mid-edit"
+        — we leave ``self._cwd`` at its previous value rather than
+        coerce ``Path("")`` (which resolves to ``Path(".")``) into the
+        runner. The user can clear the field and type a new path
+        without the dialog briefly committing the current process
+        cwd in between.
+
+        Validation is deliberately deferred to Run time: Popen
+        raises on a missing cwd, and the existing
+        :meth:`_on_worker_failed` path surfaces a clean error
+        message. Mirroring the comment on the row above (and the
+        "shell ``cd``" idiom), typing a path you can't ``cd`` into
+        is a Run-time failure, not a typing-time veto.
+
+        Idempotent against Browse: ``_on_browse_cwd`` sets
+        ``self._cwd`` *before* calling ``setText``, so by the time
+        this handler runs the equality check short-circuits."""
+        stripped = text.strip()
+        if not stripped:
+            return
+        new_cwd = Path(stripped)
+        if new_cwd == self._cwd:
+            return
+        _log(f"working directory typed: {self._cwd} -> {new_cwd}")
+        self._cwd = new_cwd
+
     def _on_browse_cwd(self) -> None:
         """Open a native folder picker rooted at the current cwd; on
         accept, replace ``self._cwd`` and the displayed path. Uses
@@ -932,7 +1187,7 @@ class TestSkillDialog(QDialog):
         # Proactive hint — prompt for trust now so the user knows
         # the policy before they type a prompt. Decline is non-fatal;
         # the Run-click boundary will ask again, and the existing
-        # "Skip permission prompts" checkbox is still an escape hatch.
+        # "Skip Permission Prompts" checkbox is still an escape hatch.
         # Per the action-boundary rule (feedback-checkbox-invariant-
         # at-action), the *load-bearing* check is at Run, not here.
         self._ensure_cwd_trusted(new_cwd, ask_user=True)
@@ -970,26 +1225,45 @@ class TestSkillDialog(QDialog):
 
     def _on_trust_dir_text_changed(self, text: str) -> None:
         """Sync the inline clear action's visibility with text presence,
-        and reset ``self._trust_dir`` when the field becomes empty.
+        and keep ``self._trust_dir`` in lockstep with the field on
+        every mutation — typing, Browse, or the inline clear "×".
 
         ``textChanged`` fires for every text mutation: programmatic
         ``setText`` from :meth:`_on_browse_trust_dir`, the inline
-        clear action's slot calling ``QLineEdit.clear()``, etc. We do
-        two cheap things every time: toggle the action icon's
-        visibility (so it appears only when there's text to clear),
-        and on the empty transition reset ``self._trust_dir`` so the
-        next Run omits ``--add-dir``."""
+        clear action's slot calling ``QLineEdit.clear()``, AND every
+        keystroke now that the field is editable. We do three cheap
+        things on each fire:
+
+        1. Toggle the action icon's visibility (so it appears only
+           when there's text to clear).
+        2. On empty / whitespace text: reset ``self._trust_dir`` to
+           ``None`` so the next Run omits ``--add-dir``. Whitespace
+           is treated as "no path" — same shape as cwd typing
+           tolerance.
+        3. On non-empty text: set ``self._trust_dir`` to the
+           ``Path`` parsed from the input. Validation deferred to
+           Run time, mirroring :meth:`_on_cwd_text_changed`.
+
+        Browse path stays idempotent: it sets ``self._trust_dir``
+        before calling ``setText``, so the equality short-circuit
+        keeps the log clean."""
         # Guard against this firing before _build_ui finishes wiring
         # the action (the QLineEdit's initial text triggers no signal,
         # so in practice this is just belt-and-braces).
         if hasattr(self, "_trust_clear_action"):
             self._trust_clear_action.setVisible(bool(text))
-        if text:
+        stripped = text.strip()
+        if not stripped:
+            if self._trust_dir is None:
+                return  # already None — nothing to log or sync
+            _log(f"trust directory cleared (was {self._trust_dir})")
+            self._trust_dir = None
             return
-        if self._trust_dir is None:
-            return  # already None — nothing to log or sync
-        _log(f"trust directory cleared (was {self._trust_dir})")
-        self._trust_dir = None
+        new_dir = Path(stripped)
+        if self._trust_dir == new_dir:
+            return  # programmatic Browse → setText already in sync
+        _log(f"trust directory typed: {self._trust_dir} -> {new_dir}")
+        self._trust_dir = new_dir
 
     def _on_clear_trust_dir_action(self) -> None:
         """Triggered by the inline "×" action. Clears the QLineEdit;
@@ -1020,7 +1294,7 @@ class TestSkillDialog(QDialog):
           accept, write the trust flag and return True. On decline or
           write failure, return False.
 
-        Decoupled from "Skip permission prompts" deliberately. Trust
+        Decoupled from "Skip Permission Prompts" deliberately. Trust
         and per-tool permissions are two different gates inside the
         CLI: trust is whether the directory is allowed at all; tool
         permissions are which operations are allowed once trusted.
@@ -1062,7 +1336,7 @@ class TestSkillDialog(QDialog):
                 "Could not record trust flag",
                 f"Failed to update {claude_config_path()}:\n\n{exc}\n\n"
                 f"You can still proceed by enabling "
-                f"'Skip permission prompts'.",
+                f"'Skip Permission Prompts'.",
             )
             return False
         _log(f"trust granted for {path}")
@@ -1190,45 +1464,85 @@ class TestSkillDialog(QDialog):
                 self.status_label.setText("Type a prompt first")
                 return
 
-            # Enforce the Prefix Skill Name checkbox at Run time.
-            # Construction-time seeding plants ``/<skill> `` in the
-            # prompt buffer, but a user who selects-all and retypes
-            # silently wipes the prefix while the checkbox stays
-            # ticked — so the checkbox claim "my prompt has the
-            # prefix" diverged from reality. The toggle handler only
-            # fires on explicit clicks, not buffer edits, so the only
-            # robust place to reconcile the two is right before the
-            # invocation. We also update the editor so the user sees
-            # the prompt that's actually being sent.
-            if self.prefix_checkbox.isChecked():
-                prefix = self._skill_prefix()
-                already_prefixed = (
-                    prompt == prefix
-                    or prompt.startswith(prefix + " ")
-                    or prompt.startswith(prefix + "\n")
-                )
-                if not already_prefixed:
-                    prompt = f"{prefix} {prompt}"
-                    cursor = self.prompt_edit.textCursor()
-                    cursor.beginEditBlock()
-                    cursor.select(QTextCursor.SelectionType.Document)
-                    cursor.removeSelectedText()
-                    cursor.insertText(prompt)
-                    cursor.endEditBlock()
+            # Action-boundary validation of the directory fields.
+            # The textChanged handlers intentionally don't validate
+            # per-keystroke (see ``_on_cwd_text_changed`` docstring);
+            # this is the one place the paths are checked before
+            # they're handed to Popen / --add-dir. ``is_dir()``
+            # catches both "missing" and "points at a file" in one
+            # call. Trust Directory is optional — ``None`` means no
+            # ``--add-dir`` grant, which is a valid choice — so it's
+            # only validated when actually set.
+            #
+            # Surfaced via ``QMessageBox.warning`` only — the modal
+            # is the visible alert; no status_label breadcrumb is
+            # needed (the user has already acknowledged the dialog).
+            if not self._cwd.is_dir():
+                _log(f"run aborted: cwd does not exist: {self._cwd}")
+                QMessageBox.warning(
+                    self, "Working Directory not found",
+                    f"Working Directory does not exist:\n\n"
+                    f"{self._cwd}\n\n"
+                    f"Fix the path and try again.")
+                return
+            if (self._trust_dir is not None
+                    and not self._trust_dir.is_dir()):
+                _log(
+                    "run aborted: trust dir does not exist: "
+                    f"{self._trust_dir}")
+                QMessageBox.warning(
+                    self, "Trust Directory not found",
+                    f"Trust Directory does not exist:\n\n"
+                    f"{self._trust_dir}\n\n"
+                    f"Fix the path or clear it.")
+                return
+
+            # Prefix Skill Name checkbox is a *prompt-editing
+            # shortcut*, NOT a send-time invariant: toggling it
+            # adds / removes the ``/<skill> `` token in the prompt
+            # textbox (see ``_on_prefix_toggled``), and Run sends
+            # whatever is currently in the textbox verbatim. The
+            # user owns the prompt — if they ticked the box and
+            # then manually deleted the prefix, that's an explicit
+            # choice and Run respects it. (Earlier versions
+            # re-enforced the checkbox state at this point, which
+            # silently put the prefix back; that surprised users
+            # who'd manually removed it.)
 
             # Pull live values from Settings on each run. A Settings
             # dialog change therefore applies to the very next click of
             # Run, without reopening this dialog.
             model = app_settings.get_model()
             api_key = app_settings.get_api_key()
-            # Continue-mode decision (§7.46): checkbox state at click
-            # time, snapshotted onto self for the worker-result slot
-            # to see. Resume id is only included when continue is on
-            # AND we have a session id from a prior turn — first Run
-            # with the box checked has no id yet and runs fresh.
-            continue_mode = self.continue_checkbox.isChecked()
-            resume_id = self._session_id if continue_mode else ""
-            self._last_run_was_continue = continue_mode
+            # Continue-mode is unconditional (§7.46). Resume id is
+            # included whenever we have a session id from a prior turn
+            # in THIS dialog instance; the first Run has no id yet and
+            # runs fresh. Dialog close drops the in-memory state, so
+            # the very next open is also fresh (§7.68). ``Clear`` is
+            # the explicit gesture to forget the session mid-dialog —
+            # there is no per-run opt-out (the checkbox this used to
+            # live behind was removed once the default was deemed
+            # strong enough to not need an escape hatch).
+            #
+            # Action-boundary cwd check (§7.68): a session_id is only
+            # valid under the cwd it was captured at — Claude CLI
+            # scopes conversation history to the cwd's project slug,
+            # and reusing an id across cwds errors out with "No
+            # conversation found with session ID …". When the user
+            # has changed cwd since the last capture (via Browse or
+            # by typing into the Working Directory field), drop the
+            # stale session here so the next ``--resume`` argument is
+            # built from a None state — i.e. omitted entirely.
+            if (self._session_id is not None
+                    and self._session_cwd is not None
+                    and self._cwd.resolve()
+                    != self._session_cwd.resolve()):
+                _log(f"  dropping session {self._session_id} "
+                     f"captured at {self._session_cwd} "
+                     f"(current cwd {self._cwd} differs)")
+                self._session_id = None
+                self._session_cwd = None
+            resume_id = self._session_id or ""
             # Permission-skip decision (§7.50). Read at click time —
             # toggling mid-run only affects the *next* Run, never
             # the one already in flight.
@@ -1273,12 +1587,27 @@ class TestSkillDialog(QDialog):
                 prompt,
                 model=model,
                 session_id=resume_id,
-                json_output=continue_mode,
+                # Stream-json is always on for the test runner
+                # (§7.60). The Activity tab consumes events as they
+                # arrive; session_id, response markdown, and usage
+                # stats are extracted from stream events in
+                # ``_on_stream_event`` and stashed for the verdict
+                # handler. The plain JSON envelope mode this used
+                # to take (when continue mode was on) is now
+                # subsumed — stream-json's terminal ``result``
+                # event carries everything the envelope did.
+                stream_json=True,
                 skip_permissions=skip_perms,
                 extra_read_dirs=extra_read_dirs,
             )
             env_overrides = claude_env_overrides(api_key)
             timeout_ms = _test_run_timeout_ms()
+            # Snapshot for this run only (§7.59). Extend buttons
+            # mutate ``self._current_timeout_ms`` mid-run; the tick
+            # display and the TIMED OUT verdict read from the snapshot
+            # so they stay coherent with what the timer will actually
+            # do.
+            self._current_timeout_ms = timeout_ms
             timeout_s = timeout_ms / 1000
 
             _log("=" * 60)
@@ -1287,7 +1616,7 @@ class TestSkillDialog(QDialog):
             _log(f"  cmd: {cmd!r}")
             _log(f"  model: {model!r}  (empty = let claude pick)")
             _log(f"  api_key override: {'yes' if api_key else 'no'}")
-            _log(f"  continue: {continue_mode}  resume_id: "
+            _log(f"  resume_id: "
                  f"{resume_id or '(none — fresh session)'}")
             _log(f"  skip_permissions: {skip_perms}")
             # Snapshot the cwd choice now — needed in the diagnostic
@@ -1306,14 +1635,51 @@ class TestSkillDialog(QDialog):
             self._was_cancelled = False
             self._timed_out = False
             self._received_bytes = 0
-            if continue_mode and resume_id:
+            # Reset stream-event capture (§7.60). Done HERE in
+            # ``_on_run`` rather than inside ``_clear_run_views``
+            # because ``_clear_run_views`` is also called from the
+            # user-facing Clear button, where wiping the
+            # session_id and response text would silently lose the
+            # captured-from-last-run resume id. Per-Run reset is
+            # the right scope.
+            self._stream_response_text = ""
+            self._stream_is_error = False
+            self._stream_usage = None
+            self._stream_event_count = 0
+            # NB: don't reset _stream_session_id here — system/init
+            # will overwrite it on the next stream, and clearing it
+            # before that arrival would race with continue-mode
+            # capture across Runs.
+            if resume_id:
                 self.status_label.setText(
                     f"Resuming session {resume_id[:8]}…")
             else:
                 self.status_label.setText("Starting…")
             self.run_btn.setEnabled(False)
             self.cancel_btn.setEnabled(True)
+            # Mid-Run the worker is actively appending to Activity /
+            # Raw Output; letting the user load an external file
+            # would clobber the live stream and the next event would
+            # then layer on top of the loaded content. Disable until
+            # _finish_run flips it back. Save As… stays available
+            # because saving in-flight content is sometimes useful.
+            self._open_file_btn.setEnabled(False)
+            # Per-tab Clear is gated mid-Run by
+            # ``_update_clear_tab_btn_state`` (it short-circuits on
+            # ``_is_running()``), but we also disable explicitly here
+            # so the visual flip happens at the action boundary, not
+            # whenever the next ``_update_save_btn_state`` happens to
+            # fire. Same reasoning as the Open File button above.
+            self._clear_tab_btn.setEnabled(False)
             self.run_busy.show()
+            for btn in self._extend_buttons:
+                btn.show()
+            # Surface the live event stream (§7.60) as soon as Run is
+            # clicked — Activity is where new content arrives during a
+            # run, so auto-selecting it spares the user the manual tab
+            # click. Mirrored by the switch back to Response in
+            # ``_teardown_process`` once the run finishes.
+            self._response_tabs.setCurrentIndex(self._SUB_ACTIVITY)
 
             # Diagnostic preface — rendered shell-like for copy/paste
             # debugging. Conditional lines are omitted in the default
@@ -1325,9 +1691,12 @@ class TestSkillDialog(QDialog):
                 diag_lines.append(f"  --model {model}")
             if resume_id:
                 diag_lines.append(f"  --resume {resume_id}")
-            if continue_mode:
-                diag_lines.append("  --output-format json  "
-                                  "(continue mode — parsed for session id)")
+            # Stream-json + verbose are always emitted now (§7.60).
+            # Surface them in the diagnostic preface so the shell
+            # copy/paste lines up with what actually ran.
+            diag_lines.append(
+                "  --output-format stream-json --verbose  "
+                "(live activity stream)")
             if skip_perms:
                 # The flag's name carries its own warning; surface it
                 # verbatim in the user-visible Raw Output so there's
@@ -1354,7 +1723,15 @@ class TestSkillDialog(QDialog):
                 f"  (timeout: {int(timeout_s)}s; running in "
                 f"background — UI stays responsive)")
             diag_lines.append("")
-            self._append_raw("\n".join(diag_lines))
+            self._append_both("\n".join(diag_lines))
+
+            # Pretty-only prompt prefix line — mirrors Claude Code's
+            # terminal convention where the user prompt appears as a
+            # ``> ...`` header before the assistant's narrative. Adds
+            # context to the Pretty view without polluting the Raw
+            # JSON view (which already shows the prompt as a CLI arg
+            # in the diagnostic preface).
+            self._append_pretty_buf(f"> {prompt}\n\n")
 
             # ``run_cwd`` was assigned above (before the log/diag
             # preface block) — it snapshots the cwd selection at click
@@ -1382,7 +1759,7 @@ class TestSkillDialog(QDialog):
         except Exception as e:
             tb = traceback.format_exc()
             _log(f"OUTER EXCEPTION in _on_run:\n{tb}")
-            self._append_raw(
+            self._append_both(
                 f"\n[INTERNAL ERROR in _on_run]\n{tb}\n")
             self.status_label.setText(f"ERROR: {e}")
             self._teardown_process()
@@ -1449,6 +1826,11 @@ class TestSkillDialog(QDialog):
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                # Line-buffered so the for-line iterator below
+                # surfaces each newline as soon as the child flushes
+                # it — required for the live Activity tab to show
+                # events as they happen rather than at process exit.
+                bufsize=1,
             )
             _log(f"[worker] Popen succeeded, pid={proc.pid}")
         except (FileNotFoundError, OSError, PermissionError) as e:
@@ -1468,22 +1850,78 @@ class TestSkillDialog(QDialog):
         with self._worker_lock:
             self._subproc = proc
 
-        _log("[worker] calling communicate()…")
+        # ---- Streaming read (§7.60) ----
+        # ``communicate()`` is replaced with a line-by-line iterator
+        # so the GUI can render events as they arrive. We still need
+        # to accumulate both streams in full so ``_worker_result``
+        # gets the same payload contract as the pre-stream code
+        # path (the verdict handler reads ``stdout`` as a fallback
+        # when no ``result`` event was captured).
+        #
+        # Stderr is drained on a sidecar thread to prevent the
+        # classic pipe-buffer deadlock: if claude wrote a few MB to
+        # stderr while we were only reading stdout, its stderr-side
+        # write() would block, claude would stop emitting on stdout,
+        # and we'd hang forever waiting for the next stdout line.
+        # The sidecar drains concurrently into a local list.
+        stdout_accum: list[str] = []
+        stderr_accum: list[str] = []
+
+        def _drain_stderr() -> None:
+            try:
+                for sline in proc.stderr:
+                    stderr_accum.append(sline)
+            except Exception:
+                # Pipe closed unexpectedly (process killed mid-write)
+                # — the main thread will pick up the exit code; the
+                # partial stderr we got is good enough.
+                pass
+
+        stderr_thread = threading.Thread(
+            target=_drain_stderr,
+            daemon=True,
+            name="ClaudeTestSkillStderr",
+        )
+        stderr_thread.start()
+        _log("[worker] stderr drainer thread started")
+
         try:
-            stdout, stderr = proc.communicate()
-            _log(f"[worker] communicate returned: exit={proc.returncode}")
-            _log(f"  stdout: {len(stdout)} chars")
-            _log(f"  stderr: {len(stderr)} chars")
+            for line in proc.stdout:
+                stdout_accum.append(line)
+                # Emit per-line. Qt's QueuedConnection serializes
+                # delivery on the GUI thread's event loop, so a
+                # burst of events stays in order even if the GUI
+                # is briefly busy.
+                self._worker_stream_event.emit(line)
         except Exception:
             tb = traceback.format_exc()
-            _log(f"[worker] communicate raised:\n{tb}")
-            self._worker_failed.emit(
-                f"communicate() raised:\n{tb}")
-            return
+            _log(f"[worker] stdout iter raised:\n{tb}")
+            # Don't bail out — proc.wait() below still needs to run
+            # so we can collect the exit code. The accumulated
+            # partial stdout is reported in _worker_result.
 
-        _log("[worker] emitting _worker_result")
+        # Wait for the process to actually exit and the stderr
+        # drainer to finish. Short stderr join timeout (the drainer
+        # exits when the stderr pipe closes, which the kernel does
+        # right after the child exits).
+        try:
+            exit_code = proc.wait()
+        except Exception:
+            tb = traceback.format_exc()
+            _log(f"[worker] proc.wait() raised:\n{tb}")
+            self._worker_failed.emit(
+                f"proc.wait() raised:\n{tb}")
+            return
+        stderr_thread.join(timeout=1.0)
+
+        _log(f"[worker] streaming done: exit={exit_code}, "
+             f"stdout_lines={len(stdout_accum)}, "
+             f"stderr_lines={len(stderr_accum)}")
         self._worker_result.emit(
-            proc.returncode, stdout or "", stderr or "")
+            exit_code,
+            "".join(stdout_accum),
+            "".join(stderr_accum),
+        )
         _log("[worker] _worker_main END")
 
     def _on_worker_result(
@@ -1495,51 +1933,14 @@ class TestSkillDialog(QDialog):
         _log(f"[gui] _on_worker_result: exit={exit_code}, "
              f"stdout={len(stdout)} chars, stderr={len(stderr)} chars")
 
-        if stdout:
-            # Continue-mode (§7.46) runs ``claude --output-format json``,
-            # which serializes the entire turn as a single-line JSON
-            # envelope. The ``"result"`` string inside contains literal
-            # ``\n`` escapes (two characters, the JSON spelling of a
-            # newline) — appending that single line to the Raw Output
-            # tab gives a wall-of-text with no actual line breaks. Fix:
-            # pretty-print the envelope so the keys lay out vertically,
-            # then add a "decoded result" block that re-emits the
-            # ``"result"`` field with real newlines — so the user sees
-            # both views (envelope structure for debugging, decoded
-            # text for reading).
-            wrote_pretty = False
-            if self._last_run_was_continue:
-                try:
-                    envelope = json.loads(stdout)
-                except (ValueError, TypeError):
-                    envelope = None
-                if isinstance(envelope, dict):
-                    pretty = json.dumps(
-                        envelope, indent=2, ensure_ascii=False)
-                    self._append_raw(pretty)
-                    if not pretty.endswith("\n"):
-                        self._append_raw("\n")
-                    result_text = envelope.get("result", "")
-                    if isinstance(result_text, str) and result_text:
-                        self._append_raw(
-                            "\n---- decoded result "
-                            "(newlines rendered) ----\n")
-                        self._append_raw(result_text)
-                        if not result_text.endswith("\n"):
-                            self._append_raw("\n")
-                    wrote_pretty = True
-            # Fallback path: not JSON mode, or JSON parse failed. Append
-            # stdout verbatim — preserves the legacy behaviour for the
-            # non-continue runs and gives a usable view of malformed
-            # JSON without losing any bytes.
-            if not wrote_pretty:
-                self._append_raw(stdout)
-                if not stdout.endswith("\n"):
-                    self._append_raw("\n")
+        # Raw Output already has every stream event appended verbatim
+        # via ``_on_stream_event`` (§7.60). No need to re-dump
+        # ``stdout`` here — doing so would duplicate every line.
+        # The stderr drain still needs to be surfaced, though.
         if stderr.strip():
-            self._append_raw(f"\n[stderr]\n{stderr}")
+            self._append_both(f"\n[stderr]\n{stderr}")
             if not stderr.endswith("\n"):
-                self._append_raw("\n")
+                self._append_both("\n")
 
         duration = 0.0
         if self._run_started_at is not None:
@@ -1547,10 +1948,13 @@ class TestSkillDialog(QDialog):
         self._received_bytes = len(stdout) + len(stderr)
 
         if self._timed_out:
-            limit = _test_run_timeout_ms() // 1000
+            # Per-run snapshot (§7.59) — so the printed limit
+            # reflects any extensions the user clicked, not the
+            # original settings value at run start.
+            limit = self._current_timeout_ms // 1000
             self.status_label.setText(
                 f"TIMED OUT after {duration:.1f}s (limit {limit}s)")
-            self._append_raw(
+            self._append_both(
                 f"\n[timed out after {duration:.1f}s]\n"
                 f"\nTry the prompt manually in a terminal:\n"
                 f"  claude --print \"<prompt>\"\n"
@@ -1567,59 +1971,89 @@ class TestSkillDialog(QDialog):
         elif self._was_cancelled:
             self.status_label.setText(
                 f"Cancelled after {duration:.1f}s")
-            self._append_raw(
+            self._append_both(
                 f"\n[cancelled by user after {duration:.1f}s]\n")
             self._set_response_markdown(
                 f"*Cancelled by user after {duration:.1f}s.*")
         elif exit_code != 0:
             self.status_label.setText(
                 f"Exit {exit_code} after {duration:.1f}s")
-            self._append_raw(
+            self._append_both(
                 f"\n[exited with code {exit_code} "
                 f"after {duration:.1f}s]\n")
-            # Render whatever stdout we got, since some commands
-            # emit useful output even on non-zero exit (e.g., usage
-            # errors). The Raw Output tab has the exit-code marker.
-            self._set_response_markdown(stdout)
-        else:
-            out_tokens = estimated_token_count(stdout)
-            self._append_raw(
-                f"\n[done in {duration:.1f}s · "
-                f"{self._received_bytes:,} chars total]\n")
-            # The happy path — render the model's response as
-            # markdown so headers, lists, code blocks, and other
-            # markup display the way claude intends (§7.44).
-            #
-            # Continue-mode runs (§7.46) emitted JSON instead of
-            # plain markdown — extract the `result` field as the
-            # rendered response and capture `session_id` so the next
-            # Run can pass --resume <id>. Parse failures fall back
-            # to the raw stdout so the user never sees a blank
-            # Response tab.
-            if self._last_run_was_continue:
-                response_text, new_session_id, is_error = (
-                    parse_claude_json_envelope(stdout))
-                if new_session_id:
-                    self._session_id = new_session_id
-                    self._update_session_label()
-                    _log(f"  captured session_id: {new_session_id}")
-                else:
-                    _log("  no session_id in JSON envelope; "
-                         "next continue Run will start fresh")
-                if is_error:
-                    response_text = (
-                        "**Claude reported an error for this turn.**\n\n"
-                        + response_text)
-                self.status_label.setText(
-                    f"Done in {duration:.1f}s · "
-                    f"≈{estimated_token_count(response_text):,} tokens out · "
-                    f"session {self._session_id[:8] if self._session_id else '?'}…")
-                self._set_response_markdown(response_text)
+            # Prefer the stream-captured response if a ``result``
+            # event arrived before claude exited; some failure modes
+            # (rate limit, transient API error) emit a result event
+            # *and* a non-zero exit code, and the result text is
+            # what the user actually wants to read. Falls back to a
+            # generic notice when no useful text was captured —
+            # dumping the raw event-line stream as markdown would
+            # render as unreadable JSON soup.
+            if self._stream_response_text:
+                self._set_response_markdown(
+                    self._stream_response_text)
             else:
-                self.status_label.setText(
-                    f"Done in {duration:.1f}s · "
-                    f"≈{out_tokens:,} tokens out")
-                self._set_response_markdown(stdout)
+                self._set_response_markdown(
+                    f"**`claude` exited with code {exit_code} "
+                    f"after {duration:.1f}s and produced no final "
+                    f"answer.** See the **Activity** and **Raw "
+                    f"Output** tabs for what was emitted before exit.")
+        else:
+            # Happy path. Stream-json terminal ``result`` event has
+            # already populated ``_stream_response_text`` with the
+            # rendered markdown response, ``_stream_session_id``,
+            # ``_stream_usage``, and ``_stream_is_error``. Use
+            # those when present; fall back to raw stdout only if
+            # the stream ended without a ``result`` event (e.g.,
+            # claude crashed mid-stream — already handled as
+            # exit_code != 0 above, but defensive coverage here
+            # too).
+            response_text = self._stream_response_text or stdout
+            # Capture session_id eagerly so the next Run *within this
+            # dialog* can resume. In-memory only (§7.68 reverses §7.65
+            # / §7.67 cross-open persistence) — closing the window
+            # drops the id, so a fresh open is always a fresh
+            # conversation. ``_session_cwd`` is paired with the id so
+            # the next Run's action-boundary cwd check can detect a
+            # mid-dialog cwd change and drop the (now invalid) id
+            # before it ever reaches ``--resume``.
+            if self._stream_session_id:
+                self._session_id = self._stream_session_id
+                self._session_cwd = self._cwd
+                _log(f"  captured session_id: "
+                     f"{self._stream_session_id} "
+                     f"(cwd: {self._session_cwd})")
+            if self._stream_is_error:
+                response_text = (
+                    "**Claude reported an error for this turn.**\n\n"
+                    + response_text)
+            # Prefer real usage counts from the result event over
+            # the char-based heuristic (§7.60). Output tokens are
+            # what the user usually wants in the verdict; if
+            # unavailable, fall back to the heuristic.
+            usage_out = None
+            if isinstance(self._stream_usage, dict):
+                u_out = self._stream_usage.get("output_tokens")
+                if isinstance(u_out, int):
+                    usage_out = u_out
+            if usage_out is None:
+                usage_out = estimated_token_count(response_text)
+                tokens_label = f"≈{usage_out:,} tokens"
+            else:
+                tokens_label = f"{usage_out:,} tokens"
+            self._append_both(
+                f"\n[done in {duration:.1f}s · "
+                f"{self._received_bytes:,} chars total · "
+                f"{self._stream_event_count} events]\n")
+            # Status-bar verdict is intentionally session-agnostic —
+            # the captured id is persisted silently per-skill in
+            # QSettings, so surfacing "session abc12345…" here would
+            # add visual noise without giving the user anything
+            # actionable. Continuation across Runs (and across dialog
+            # reopens for the same skill) Just Works.
+            self.status_label.setText(
+                f"Done in {duration:.1f}s · {tokens_label} out")
+            self._set_response_markdown(response_text)
 
         self._teardown_process()
         _log(f"_on_run END")
@@ -1636,7 +2070,7 @@ class TestSkillDialog(QDialog):
         )
         if is_not_found:
             diag = claude_path_diagnostic()
-            self._append_raw(
+            self._append_both(
                 f"\n[error] Could not launch `claude`.\n"
                 f"  {error_msg}\n"
                 f"\n--- Path resolution diagnostic ---\n"
@@ -1651,7 +2085,7 @@ class TestSkillDialog(QDialog):
                 "or use the **Check Claude** button on the main "
                 "toolbar to verify your install.")
         else:
-            self._append_raw(f"\n[error] {error_msg}\n")
+            self._append_both(f"\n[error] {error_msg}\n")
             first_line = (
                 error_msg.splitlines()[0][:80] if error_msg else "?")
             self.status_label.setText(f"Worker error: {first_line}")
@@ -1690,34 +2124,570 @@ class TestSkillDialog(QDialog):
         if self._run_started_at is None or not self._is_running():
             return
         elapsed = time.monotonic() - self._run_started_at
-        timeout_s = _test_run_timeout_ms() / 1000
+        # Read from the per-run snapshot, not the settings store
+        # (§7.59). The extend buttons mutate this in place; the
+        # settings value only seeds it at run start.
+        timeout_s = self._current_timeout_ms / 1000
         remaining = max(0.0, timeout_s - elapsed)
         self.status_label.setText(
             f"Running… {elapsed:.1f}s · waiting for response "
             f"(timeout in {remaining:.0f}s)")
 
-    def _append_raw(self, text: str) -> None:
-        """Append to the **Raw Output** tab (§7.44). Used for the
-        diagnostic preface, raw stdout chunks, stderr lines, and
-        verdict markers — the chronological trace of what happened
-        during the run.
+    def _on_stream_event(self, line: str) -> None:
+        """Slot for ``_worker_stream_event`` (§7.60).
+
+        Receives one raw JSON line from the worker thread (auto-
+        marshalled by Qt's queued connection), parses it, dispatches
+        by ``type`` to update the Activity tab, status label, and
+        the captured-state instance fields (response text /
+        session_id / usage / is_error) that ``_on_worker_result``
+        reads at run end.
+
+        Robustness contract: never raises. A malformed line shouldn't
+        cancel the rest of the stream — log it as a `(unparsed)`
+        activity entry and move on. An unknown ``type:`` shouldn't
+        crash the parser — log it as `(unknown event: <type>)` and
+        move on. The Raw Output tab still receives every line
+        verbatim, so the user can debug from the literal stream even
+        if our formatter doesn't recognize the shape."""
+        line = line.rstrip("\r\n")
+        if not line:
+            return
+        # Mirror to the Raw JSON buffer verbatim — preserves the
+        # chronological diagnostic trail and keeps the
+        # schema-tolerant debug affordance (§7.60): every line that
+        # crossed the pipe is recoverable, even if our pretty
+        # formatter doesn't recognize the shape. The CLI-style
+        # pretty buffer gets its rendering from the per-event
+        # handlers below.
+        self._append_raw_buf(line + "\n")
+        # Parse. JSON failure → activity entry + return; downstream
+        # readers cope with the missing fields.
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            self._append_activity_html(
+                self._fmt_ts(),
+                "⚠",
+                f"<span style='color:#a00;'>unparsed: "
+                f"{html.escape(line[:120])}</span>",
+            )
+            return
+        if not isinstance(event, dict):
+            return
+        self._stream_event_count += 1
+        event_type = event.get("type")
+        # Dispatch. Each branch can both update Activity (visible
+        # narrative) and stash data into the ``_stream_*`` fields
+        # (consumed by ``_on_worker_result``). Status label gets the
+        # latest short summary so the user sees what claude is
+        # currently doing — overrides the elapsed-time text from
+        # ``_on_tick`` until the next tick fires (at most 500ms
+        # later, by which point another event has usually arrived).
+        if event_type == "system":
+            self._handle_stream_system(event)
+        elif event_type == "assistant":
+            self._handle_stream_assistant(event)
+        elif event_type == "user":
+            self._handle_stream_user(event)
+        elif event_type == "result":
+            self._handle_stream_result(event)
+        else:
+            # Unknown event types are logged but don't break the
+            # parser. ``claude``'s stream-json schema may grow new
+            # event kinds across CLI versions; tolerating unknowns
+            # is what keeps us forward-compatible.
+            self._append_activity_html(
+                self._fmt_ts(),
+                "·",
+                f"<span style='color:#888;'>event: "
+                f"{html.escape(str(event_type))}</span>",
+            )
+
+    def _handle_stream_system(self, event: dict) -> None:
+        """``type=system`` event — usually ``subtype=init`` with the
+        initial session_id + model. We capture session_id eagerly
+        (harmless when continue-mode is off; the field is only read
+        on Continue runs) so resume works even if the user toggles
+        the checkbox between runs."""
+        subtype = event.get("subtype", "")
+        session_id = event.get("session_id")
+        if isinstance(session_id, str) and session_id:
+            self._stream_session_id = session_id
+        if subtype == "init":
+            model = event.get("model") or "?"
+            short_session = (session_id or "?")[:8]
+            summary = (
+                f"<b>session {html.escape(short_session)}…</b> "
+                f"<span style='color:#666;'>"
+                f"(model: {html.escape(str(model))})</span>")
+            self._append_activity_html(self._fmt_ts(), "▸", summary)
+            self._set_status_step(f"Session {short_session}… started")
+            # Pretty: one-line session header. Matches the CLI
+            # terminal's per-run banner shape — short session id +
+            # model, no timestamp (the diagnostic preface above
+            # already carries the launch timing).
+            self._append_pretty_buf(
+                f"▸ session {short_session}… · model: {model}\n\n")
+        else:
+            # Activity surfaces every system sub-event so the
+            # debugging trail is complete. Pretty stays quiet for
+            # non-init system events (hook_started / hook_response
+            # etc.) — the CLI terminal doesn't surface them either,
+            # and they'd clutter the transcript. Users who want them
+            # can flip the toggle to Raw JSON.
+            self._append_activity_html(
+                self._fmt_ts(), "·",
+                f"<span style='color:#888;'>system: "
+                f"{html.escape(str(subtype))}</span>")
+
+    def _handle_stream_assistant(self, event: dict) -> None:
+        """``type=assistant`` event — the model emitted a message.
+        Content is a list of blocks; ``text`` blocks contribute to
+        the assistant's reply (which we accumulate for fallback
+        rendering), ``tool_use`` blocks are calls into Read/Bash/etc.
+        whose inputs we surface so the user can see what claude is
+        about to do."""
+        message = event.get("message") or {}
+        content = message.get("content") or []
+        if not isinstance(content, list):
+            return
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                text = block.get("text") or ""
+                if isinstance(text, str) and text:
+                    excerpt = text.strip().splitlines()[0][:140]
+                    if len(text) > 140 or "\n" in text:
+                        excerpt += "…"
+                    self._append_activity_html(
+                        self._fmt_ts(), "💭",
+                        f"<span style='color:#1a3a5c;'>"
+                        f"{html.escape(excerpt)}</span>")
+                    self._set_status_step(
+                        f"Assistant: {excerpt[:60]}…")
+                    # Pretty: full assistant text (multi-line OK), capped
+                    # at 2000 chars so a runaway block doesn't dominate
+                    # the transcript. Activity's first-line truncation is
+                    # deliberately stricter — it's the scannable index;
+                    # Pretty is the readable narrative.
+                    self._append_pretty_buf(
+                        f"⏺ {self._pretty_clip(text.strip(), 2000)}\n\n")
+            elif btype == "tool_use":
+                tool_name = block.get("name") or "?"
+                tool_input = block.get("input") or {}
+                args_label = self._summarize_tool_input(tool_input)
+                self._append_activity_html(
+                    self._fmt_ts(), "🔧",
+                    f"<b>{html.escape(str(tool_name))}</b>"
+                    + (f"  <span style='color:#444;'>"
+                       f"{html.escape(args_label)}</span>"
+                       if args_label else ""))
+                self._set_status_step(f"Calling {tool_name}…")
+                # Pretty: tool call line in CLI shape —
+                # ``⏺ ToolName(key: "v1", key: "v2")``. Stash the
+                # tool name on the dialog so the next tool_result
+                # event (which doesn't repeat the name in its own
+                # payload) can correlate back to this call.
+                pretty_args = self._pretty_format_tool_input(tool_input)
+                self._stream_last_tool_name = str(tool_name)
+                if pretty_args:
+                    self._append_pretty_buf(
+                        f"⏺ {tool_name}({pretty_args})\n")
+                else:
+                    self._append_pretty_buf(f"⏺ {tool_name}()\n")
+
+    def _handle_stream_user(self, event: dict) -> None:
+        """``type=user`` event — usually the tool_result that
+        followed an assistant ``tool_use``. We surface the size +
+        error flag so the user sees the round-trip without staring
+        at multi-kilobyte tool outputs inlined in the Activity log."""
+        message = event.get("message") or {}
+        content = message.get("content") or []
+        if not isinstance(content, list):
+            return
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") != "tool_result":
+                continue
+            is_error = bool(block.get("is_error", False))
+            result = block.get("content")
+            # ``content`` can be a string or a list of {type,text}
+            # blocks depending on the tool. Coerce to a length number
+            # for the summary; the literal content is already in Raw
+            # Output for users who want to inspect it.
+            if isinstance(result, str):
+                size = len(result)
+            elif isinstance(result, list):
+                size = sum(
+                    len(b.get("text", "")) if isinstance(b, dict)
+                    else 0
+                    for b in result)
+            else:
+                size = 0
+            if is_error:
+                self._append_activity_html(
+                    self._fmt_ts(), "✗",
+                    f"<span style='color:#a00;'>"
+                    f"tool errored ({size:,} chars)</span>")
+                self._set_status_step("Tool errored")
+            else:
+                self._append_activity_html(
+                    self._fmt_ts(), "✓",
+                    f"<span style='color:#2a6f2a;'>"
+                    f"tool result ({size:,} chars)</span>")
+                self._set_status_step(
+                    f"Got tool result ({size:,} chars)")
+            # Pretty: ``  ⎿ <excerpt>`` indented continuation line
+            # under the previous tool call, ``Error:`` prefix on
+            # is_error. Matches the Claude Code terminal convention
+            # of showing a one-line peek at the result so the
+            # transcript reads as a coherent narrative without
+            # forcing the user into Raw JSON for context. Trailing
+            # blank line separates the call/result pair from the
+            # next assistant turn.
+            excerpt = self._pretty_format_tool_result_content(result)
+            if is_error:
+                if excerpt:
+                    self._append_pretty_buf(
+                        f"  ⎿ Error: {excerpt} ({size:,} chars)\n\n")
+                else:
+                    self._append_pretty_buf(
+                        f"  ⎿ Error ({size:,} chars)\n\n")
+            else:
+                if excerpt:
+                    self._append_pretty_buf(
+                        f"  ⎿ {excerpt} ({size:,} chars)\n\n")
+                else:
+                    self._append_pretty_buf(
+                        f"  ⎿ ({size:,} chars)\n\n")
+            self._stream_last_tool_name = ""
+
+    def _handle_stream_result(self, event: dict) -> None:
+        """``type=result`` event — terminal envelope. Carries the
+        rendered assistant response (``result`` field), final
+        session_id, usage stats, and the is_error flag. Stash into
+        instance fields for ``_on_worker_result`` to consume."""
+        result_text = event.get("result")
+        if isinstance(result_text, str):
+            self._stream_response_text = result_text
+        session_id = event.get("session_id")
+        if isinstance(session_id, str) and session_id:
+            self._stream_session_id = session_id
+        usage = event.get("usage")
+        if isinstance(usage, dict):
+            self._stream_usage = usage
+        self._stream_is_error = bool(event.get("is_error", False))
+        subtype = event.get("subtype", "")
+        # Per-run usage / turn / duration bits — used by both the
+        # Activity HTML and the Pretty plain-text rendering below.
+        # Pulled here once so the two branches stay in sync (one
+        # source of truth for "what numbers does this run report").
+        usage_bits: list[str] = []
+        if isinstance(usage, dict):
+            out_t = usage.get("output_tokens")
+            in_t = usage.get("input_tokens")
+            if isinstance(out_t, int):
+                usage_bits.append(f"out {out_t:,}t")
+            if isinstance(in_t, int):
+                usage_bits.append(f"in {in_t:,}t")
+        num_turns = event.get("num_turns")
+        if isinstance(num_turns, int):
+            usage_bits.append(f"{num_turns} turn"
+                              + ("s" if num_turns != 1 else ""))
+        duration_ms = event.get("duration_ms")
+        if isinstance(duration_ms, int):
+            usage_bits.append(f"{duration_ms / 1000:.1f}s")
+        if self._stream_is_error:
+            self._append_activity_html(
+                self._fmt_ts(), "✗",
+                f"<span style='color:#a00;'>result: "
+                f"{html.escape(str(subtype))}</span>")
+            # Pretty: terminal error line mirroring CLI shape.
+            # Subtype is the CLI's machine-readable label (e.g.
+            # ``error_max_turns``); we surface it verbatim — the
+            # user can look it up in claude's docs.
+            sub_label = subtype or "error"
+            self._append_pretty_buf(f"⏺ Error · {sub_label}\n")
+        else:
+            usage_str = (
+                " <span style='color:#666;'>(" + " · ".join(usage_bits)
+                + ")</span>" if usage_bits else "")
+            self._append_activity_html(
+                self._fmt_ts(), "✓",
+                f"<b>Done</b>{usage_str}")
+            # Pretty: terminal done line —
+            # ``⏺ Done · out 3,551t · in 12t · 7 turns · 61.2s``.
+            # Same bits as the Activity render but laid out for
+            # monospace reading.
+            if usage_bits:
+                self._append_pretty_buf(
+                    f"⏺ Done · {' · '.join(usage_bits)}\n")
+            else:
+                self._append_pretty_buf("⏺ Done\n")
+
+    def _summarize_tool_input(self, tool_input: dict) -> str:
+        """Render a tool call's input dict as a one-line label,
+        prioritizing the fields users care about (file_path,
+        command, pattern) and truncating long values so the Activity
+        tab stays scannable.
+
+        Not a pretty-printer — for the *literal* input the user can
+        consult the Raw Output tab. This is the headline label."""
+        if not isinstance(tool_input, dict):
+            return ""
+        # Order matters: try the most-informative keys first, fall
+        # back to whatever's there.
+        priority_keys = (
+            "file_path", "path", "pattern", "command", "query",
+            "url", "old_string", "new_string", "prompt",
+        )
+        for k in priority_keys:
+            v = tool_input.get(k)
+            if isinstance(v, str) and v:
+                snippet = v if len(v) <= 80 else v[:77] + "…"
+                return f"{k}={snippet!r}"
+        # Generic fallback: first key.
+        for k, v in tool_input.items():
+            if isinstance(v, (str, int, float, bool)):
+                return f"{k}={v!r}"
+        return ""
+
+    def _pretty_clip(self, text: str, limit: int) -> str:
+        """Truncate ``text`` to ``limit`` characters, appending ``…``
+        when the original was longer. Pretty-transcript helper —
+        intentionally keeps newlines (unlike ``_summarize_tool_input``
+        which collapses to single-line key=value labels). Used for
+        assistant text blocks where the CLI-terminal-style rendering
+        wants the multi-line shape preserved."""
+        if len(text) <= limit:
+            return text
+        return text[:limit - 1] + "…"
+
+    def _pretty_format_tool_input(self, tool_input: dict) -> str:
+        """Build a multi-key ``key: "v1", key: "v2"`` label for the
+        Pretty transcript. More verbose than ``_summarize_tool_input``
+        (which picks one key for the compact Activity line) — shows
+        up to three priority keys so a Bash call surfaces both
+        ``command`` and ``description``, a Read call surfaces both
+        ``file_path`` and ``offset``, and so on.
+
+        Returns the inside of the parens; the caller wraps as
+        ``ToolName(<this>)``."""
+        if not isinstance(tool_input, dict):
+            return ""
+        priority_keys = (
+            "file_path", "path", "pattern", "command", "query",
+            "url", "old_string", "new_string", "prompt",
+            "description", "offset", "limit",
+        )
+        bits: list[str] = []
+        for k in priority_keys:
+            v = tool_input.get(k)
+            if isinstance(v, str) and v:
+                snippet = v if len(v) <= 120 else v[:117] + "…"
+                bits.append(f'{k}: "{snippet}"')
+            elif isinstance(v, bool):
+                # ``bool`` first — bool IS-A int in Python, so the
+                # numeric branch below would otherwise catch it and
+                # render ``True``/``False`` capitalized. CLI style is
+                # lowercase.
+                bits.append(f"{k}: {str(v).lower()}")
+            elif isinstance(v, (int, float)):
+                bits.append(f"{k}: {v}")
+            if len(bits) >= 3:
+                break
+        if not bits:
+            # Generic fallback — same shape as _summarize_tool_input
+            # but written in the Pretty ``key: value`` style.
+            for k, v in tool_input.items():
+                if isinstance(v, (str, int, float, bool)):
+                    bits.append(f"{k}: {v!r}")
+                    if len(bits) >= 3:
+                        break
+        return ", ".join(bits)
+
+    def _pretty_format_tool_result_content(self, content) -> str:
+        """Extract a one-line ~200-char excerpt of a tool_result's
+        ``content`` field for the Pretty transcript. Returns ``""``
+        when no usable text is present.
+
+        ``content`` can be either a string (most tools) or a list of
+        ``{type, text}`` blocks (some tools — e.g. Read returns a
+        sequence). Mirrors the size-summing logic in
+        ``_handle_stream_user`` but extracts the *text* rather than
+        the length."""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            parts: list[str] = []
+            for b in content:
+                if isinstance(b, dict):
+                    t = b.get("text", "")
+                    if isinstance(t, str):
+                        parts.append(t)
+            text = "\n".join(parts)
+        else:
+            return ""
+        text = text.strip()
+        if not text:
+            return ""
+        first_line = text.splitlines()[0]
+        truncated = len(first_line) > 200 or "\n" in text
+        excerpt = first_line[:200]
+        if truncated:
+            excerpt += "…"
+        return excerpt
+
+    def _append_activity_html(
+        self, ts: str, glyph: str, body_html: str,
+    ) -> None:
+        """Append one event line to the Activity tab as a new
+        block (paragraph) in the underlying QTextDocument.
+
+        Each event must be its own block — Qt's HTML-to-document
+        converter is loose with `<div>` elements when called from a
+        cursor that's already mid-document, frequently collapsing
+        successive `<div>` inserts into inline content under the
+        previous paragraph. The visible symptom is the whole
+        activity log rendering as one wall of text. Explicit
+        ``cursor.insertBlock()`` is the load-bearing piece — it's
+        a primitive document operation, not HTML parsing, so it
+        always inserts the paragraph boundary we asked for.
+
+        Auto-scrolls to the bottom so the user always sees the
+        latest event; the normal scrollbar still works for
+        scrolling back to inspect earlier events."""
+        cursor = self.activity_view.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        # Skip the leading blank line on the very first append. An
+        # empty QTextDocument has exactly one empty block (Qt's
+        # default), so we fill that block on the first call and
+        # only create new blocks from the second event onward.
+        if not self.activity_view.document().isEmpty():
+            cursor.insertBlock()
+        cursor.insertHtml(
+            f"<span style='color:#888;font-family:Consolas,monospace;"
+            f"font-size:10pt;'>[{ts}]</span> "
+            f"<span style='font-size:11pt;'>{glyph}</span> "
+            f"<span>{body_html}</span>")
+        self.activity_view.setTextCursor(cursor)
+        self.activity_view.ensureCursorVisible()
+        self._update_save_btn_state()
+
+    def _fmt_ts(self) -> str:
+        """Run-relative HH:MM:SS.mmm timestamp for Activity entries.
+
+        Anchored at ``_run_started_at`` (set in ``_on_run``) so the
+        first event is around ``00:00:00.xxx`` — easier to reason
+        about than wall-clock time when comparing two runs of the
+        same prompt."""
+        if self._run_started_at is None:
+            return "00:00:00.000"
+        elapsed = time.monotonic() - self._run_started_at
+        h = int(elapsed // 3600)
+        m = int((elapsed % 3600) // 60)
+        s = elapsed % 60
+        return f"{h:02d}:{m:02d}:{s:06.3f}"
+
+    def _set_status_step(self, text: str) -> None:
+        """Set the status label to a per-step summary, overriding
+        the elapsed-time text from ``_on_tick`` until the next tick
+        fires. 500ms cadence means the user briefly sees the step
+        name before the countdown resumes — long enough to register,
+        not long enough to fight the tick display for dominance."""
+        self.status_label.setText(text)
+
+    def _raw_view_append(self, text: str) -> None:
+        """Append ``text`` to the visible Raw Output widget at the
+        end, scrolling the cursor into view.
 
         Uses the **fully-qualified** ``QTextCursor.MoveOperation.End``
         enum reference, not the legacy ``cursor.End`` instance
         shorthand. PySide6 6.5+ enforces strict enum scoping by
         default and the shorthand raises ``AttributeError`` — that
         was the root cause of every "hang" symptom in §7.34-§7.41
-        (§7.42)."""
+        (§7.42).
+
+        Not called directly from event sites — they go through the
+        three buffer helpers below (which decide whether to write to
+        the widget based on the active view mode)."""
         cursor = self.raw_view.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         cursor.insertText(text)
         self.raw_view.setTextCursor(cursor)
         self.raw_view.ensureCursorVisible()
-        # The Raw Output tab now has saveable content (the first
-        # append). Refresh the corner Save As… button state — cheap
-        # because _append_raw fires only a handful of times per run
-        # (preface + stdout + stderr + verdict), not per character.
+
+    def _append_raw_buf(self, text: str) -> None:
+        """Append to the raw JSON buffer (and to the visible widget
+        when Raw JSON is the active mode). Used only for the verbatim
+        stream-json event lines — every other Raw Output addition
+        (preface, stderr, verdict, [timeout extended]) goes through
+        ``_append_both`` since those texts are already CLI-readable."""
+        self._raw_buffer_text += text
+        if self._raw_view_mode == "raw":
+            self._raw_view_append(text)
         self._update_save_btn_state()
+
+    def _append_pretty_buf(self, text: str) -> None:
+        """Append to the pretty CLI-style buffer (and to the visible
+        widget when Pretty is the active mode). Called by the
+        ``_handle_stream_*`` family in parallel with the existing
+        Activity rendering — same parsed event, different output
+        sink, more verbose presentation."""
+        self._pretty_buffer_text += text
+        if self._raw_view_mode == "pretty":
+            self._raw_view_append(text)
+        self._update_save_btn_state()
+
+    def _append_both(self, text: str) -> None:
+        """Append the same ``text`` to both internal buffers and to
+        the visible widget. Used for the diagnostic preface, stderr
+        lines, verdict markers ([done in Ns] / [cancelled] / [timed
+        out] / [error]), and the [timeout extended] annotation.
+        These lines are already in a human-readable shape, so
+        rebuilding a "pretty" equivalent would only invent
+        differences — show them verbatim in both views."""
+        self._raw_buffer_text += text
+        self._pretty_buffer_text += text
+        self._raw_view_append(text)
+        self._update_save_btn_state()
+
+    def _on_raw_view_mode_changed(self, idx: int) -> None:
+        """Slot for the Pretty / Raw JSON combobox.
+
+        Reads the new mode from the combobox userData, stashes it,
+        then replaces the widget contents from the corresponding
+        internal buffer. Scroll position is intentionally NOT
+        preserved — the two transcripts have different line counts
+        and pixel heights, so a numeric scrollbar position from one
+        doesn't translate to the other. Snapping to the bottom keeps
+        the user pinned to "what's happening now" during a live run,
+        which is the dominant usage."""
+        mode = self.raw_view_mode_combo.itemData(idx)
+        if not isinstance(mode, str) or mode not in ("pretty", "raw"):
+            return
+        if mode == self._raw_view_mode:
+            return
+        self._raw_view_mode = mode
+        buf = (self._pretty_buffer_text if mode == "pretty"
+               else self._raw_buffer_text)
+        self.raw_view.setPlainText(buf)
+        sb = self.raw_view.verticalScrollBar()
+        if sb is not None:
+            sb.setValue(sb.maximum())
+        # Refresh the corner buttons — the active mode just changed,
+        # so the Save As… tooltip ("Save the Pretty transcript…" vs
+        # "Save the Raw JSON stream…") and the per-tab Clear button's
+        # has-content check both need a recompute. Also the
+        # ``raw_view`` now reflects whichever buffer just got swapped
+        # in, so emptiness can change too (Pretty might have content,
+        # Raw JSON might be empty, or vice versa).
+        self._update_save_btn_state()
+        _log(f"raw view mode → {mode}")
 
     def _set_response_markdown(self, markdown_text: str) -> None:
         """Set the **Response** tab's rendered content from a
@@ -1763,15 +2733,24 @@ class TestSkillDialog(QDialog):
                 sb.setValue(0)
 
     def _clear_run_views(self) -> None:
-        """Clear both Response and Raw Output for a fresh run.
+        """Clear Response, Activity, and Raw Output for a fresh run.
         Called from ``_on_run`` start and from the Clear button."""
         self.raw_view.clear()
         self.response_view.setMarkdown("")
+        self.activity_view.clear()
         # Drop the markdown snapshot too — keeping it would let the
         # Save As… button claim there's a response to save when the
         # tab now visibly shows nothing. Stays in sync with the
         # rule: button enabled ⇔ tab has user-visible content.
         self._last_response_markdown = ""
+        # Reset both Raw Output buffers so the next run starts with
+        # an empty Pretty AND empty Raw JSON transcript — otherwise
+        # flipping the toggle mid-next-run would reveal stale lines
+        # from the previous run. Also clear the per-run
+        # tool-call/result correlation field.
+        self._raw_buffer_text = ""
+        self._pretty_buffer_text = ""
+        self._stream_last_tool_name = ""
         self._update_save_btn_state()
 
     # ---- Save As… (§7.51) --------------------------------------------------
@@ -1788,16 +2767,121 @@ class TestSkillDialog(QDialog):
         small helper avoids three separate flag toggles drifting
         out of sync."""
         idx = self._response_tabs.currentIndex()
-        if idx == 0:  # Response
+        if idx == self._SUB_RESPONSE:
             has_content = bool(self._last_response_markdown.strip())
             ready_tip = "Save the rendered response as a .md file"
             empty_tip = "Run a prompt first — no response to save yet"
+        elif idx == self._SUB_ACTIVITY:
+            has_content = bool(
+                self.activity_view.toPlainText().strip())
+            ready_tip = (
+                "Save the activity log (visible event narrative) "
+                "as a .txt file")
+            empty_tip = "Run a prompt first — no activity to save yet"
         else:  # Raw Output
             has_content = bool(self.raw_view.toPlainText().strip())
-            ready_tip = "Save the raw output (diagnostic + stdout) as a .txt file"
+            # Mode-aware tooltip: the save path writes whatever's
+            # currently visible (``raw_view.toPlainText()``), so name
+            # the view-mode in the tooltip so the user knows which
+            # transcript they're about to write to disk.
+            mode_label = ("Pretty transcript"
+                          if self._raw_view_mode == "pretty"
+                          else "Raw JSON stream")
+            ready_tip = (
+                f"Save the {mode_label} (current view) as a .txt file")
             empty_tip = "Run a prompt first — no raw output to save yet"
         self._save_as_btn.setEnabled(has_content)
         self._save_as_btn.setToolTip(ready_tip if has_content else empty_tip)
+        # Clear button has the same enablement contract as Save As…
+        # (tab has content AND we aren't running), so propagate the
+        # refresh from here rather than duplicating seven call sites.
+        # Keeps Clear in lockstep with Save As… without parallel
+        # bookkeeping.
+        self._update_clear_tab_btn_state()
+
+    def _update_clear_tab_btn_state(self) -> None:
+        """Refresh the corner Clear button to reflect the visible
+        inner tab.
+
+        Disabled when the tab is empty (nothing to clear) and during
+        a Run (wiping a tab the worker is still writing to would be
+        immediately undone by the next stream event and would
+        confuse the user about what's happening). Tooltip names the
+        target tab so the user knows what's about to disappear.
+
+        Don't call this directly from content-mutation sites — call
+        ``_update_save_btn_state`` instead, which forwards here. The
+        forward keeps both corner buttons (Save As… / Clear) in
+        lockstep without seven duplicated update sites."""
+        if self._is_running():
+            self._clear_tab_btn.setEnabled(False)
+            self._clear_tab_btn.setToolTip(
+                "Disabled during a run — wouldn't make sense to "
+                "wipe a tab the worker is still writing to.")
+            return
+        idx = self._response_tabs.currentIndex()
+        if idx == self._SUB_RESPONSE:
+            has_content = bool(self._last_response_markdown.strip())
+            tab_name = "Response"
+        elif idx == self._SUB_ACTIVITY:
+            has_content = bool(
+                self.activity_view.toPlainText().strip())
+            tab_name = "Activity"
+        else:  # Raw Output
+            has_content = bool(self.raw_view.toPlainText().strip())
+            tab_name = "Raw Output"
+        self._clear_tab_btn.setEnabled(has_content)
+        if has_content:
+            self._clear_tab_btn.setToolTip(
+                f"Clear the {tab_name} tab "
+                "(other tabs and the prompt are untouched)")
+        else:
+            self._clear_tab_btn.setToolTip(
+                f"Nothing to clear in the {tab_name} tab")
+
+    def _on_clear_tab_clicked(self) -> None:
+        """Corner button slot — wipes the currently-visible inner
+        tab only. No confirmation prompt: the gesture is per-tab,
+        the other two tabs retain their content, and a Run can
+        always be re-executed if the user wants to regenerate.
+
+        Distinct from ``self.clear_btn`` (next to Run/Cancel) which
+        is the wholesale 'start over' gesture — prompt + all three
+        panes + session id. This one is surgical; that one is total.
+
+        Defensive ``_is_running`` guard mirrors ``_on_open_file_clicked``
+        — the button is disabled mid-Run via
+        ``_update_clear_tab_btn_state``, but a future keyboard
+        shortcut could bypass the button entirely."""
+        if self._is_running():
+            return
+        idx = self._response_tabs.currentIndex()
+        if idx == self._SUB_RESPONSE:
+            self.response_view.setMarkdown("")
+            # Snapshot reset matters here too: otherwise Save As…
+            # would still think there's content to save, mirroring
+            # the same trap _clear_run_views guards against.
+            self._last_response_markdown = ""
+            kind = "Response"
+        elif idx == self._SUB_ACTIVITY:
+            self.activity_view.clear()
+            kind = "Activity"
+        else:
+            self.raw_view.clear()
+            # Same two-buffer reset as ``_clear_run_views`` — a
+            # per-tab clear of Raw Output must wipe both modes,
+            # otherwise toggling the combobox after clearing would
+            # restore content from the other buffer and the visible
+            # "clear" gesture would silently undo itself.
+            self._raw_buffer_text = ""
+            self._pretty_buffer_text = ""
+            kind = "Raw Output"
+        # _update_save_btn_state forwards to _update_clear_tab_btn_state,
+        # so this one call refreshes both corner buttons against the
+        # now-empty target tab.
+        self._update_save_btn_state()
+        self.status_label.setText(f"{kind} tab cleared")
+        _log(f"per-tab clear: {kind}")
 
     def _on_save_as_clicked(self) -> None:
         """Corner button slot — dispatches by the visible inner tab.
@@ -1805,10 +2889,34 @@ class TestSkillDialog(QDialog):
         but the dispatch still re-checks emptiness defensively in
         case a future entry point bypasses the helper."""
         idx = self._response_tabs.currentIndex()
-        if idx == 0:
+        if idx == self._SUB_RESPONSE:
             self._save_response_as()
+        elif idx == self._SUB_ACTIVITY:
+            self._save_activity_as()
         else:
             self._save_raw_output_as()
+
+    def _save_activity_as(self) -> None:
+        """Write the Activity tab's visible event narrative to a
+        ``.txt`` file. Saves the plain-text projection (timestamps +
+        glyph + event summary), not the underlying HTML — the user
+        wants the chronological log, and a .txt file pastes cleanly
+        into bug reports or chat threads. The literal JSON event
+        stream lives in Raw Output for users who need that level
+        of detail."""
+        text = self.activity_view.toPlainText()
+        if not text.strip():
+            return
+        default = self._default_save_filename("activity", "txt")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Activity log as text",
+            default,
+            "Text files (*.txt);;All files (*)",
+        )
+        if not path:
+            return
+        self._write_text_file(Path(path), text, kind_label="activity")
 
     def _save_response_as(self) -> None:
         """Write the last rendered Response — as the markdown source
@@ -1884,6 +2992,156 @@ class TestSkillDialog(QDialog):
         _log(f"saved {kind_label}: {path}")
         self.status_label.setText(f"Saved {kind_label} → {path.name}")
 
+    # ---- Open File… --------------------------------------------------------
+    def _update_open_btn_tooltip(self) -> None:
+        """Refresh the corner Open File… button's tooltip to describe
+        which file kind the currently-visible inner tab will accept.
+        Open File… is *not* gated by content (you can always load a
+        file regardless of whether the tab is empty), only by the
+        Run lifecycle — so this helper only tunes the tooltip and
+        does not touch ``setEnabled``."""
+        idx = self._response_tabs.currentIndex()
+        if idx == self._SUB_RESPONSE:
+            tip = "Open a Markdown (.md) file into the Response tab"
+        elif idx == self._SUB_ACTIVITY:
+            tip = "Open a text (.txt) file into the Activity tab"
+        else:  # Raw Output
+            tip = "Open a text (.txt) file into the Raw Output tab"
+        self._open_file_btn.setToolTip(tip)
+
+    def _on_open_file_clicked(self) -> None:
+        """Corner button slot — dispatches by the visible inner tab.
+        Mirrors ``_on_save_as_clicked``'s shape: one entry point,
+        three per-tab loaders. Run-lifecycle gating (disable mid-
+        Run) is enforced by toggling ``_open_file_btn.setEnabled``
+        in ``_on_run`` / ``_finish_run``; this slot still runs only
+        when the button is enabled."""
+        idx = self._response_tabs.currentIndex()
+        if idx == self._SUB_RESPONSE:
+            self._open_response_file()
+        elif idx == self._SUB_ACTIVITY:
+            self._open_activity_file()
+        else:
+            self._open_raw_output_file()
+
+    def _open_response_file(self) -> None:
+        """Load a ``.md`` file into the Response tab. Routes through
+        ``_set_response_markdown`` so the loaded text is also
+        snapshot into ``_last_response_markdown`` — that means the
+        Save As… button picks it up and, if the user re-saves, the
+        round-trip is the original source, not Qt's HTML
+        re-serialization."""
+        path = self._prompt_open_path(
+            title="Open Markdown into Response",
+            file_filter="Markdown files (*.md);;All files (*)",
+        )
+        if path is None:
+            return
+        text = self._read_text_file(path, kind_label="markdown")
+        if text is None:
+            return
+        self._set_response_markdown(text)
+        self.status_label.setText(f"Loaded response ← {path.name}")
+        _log(f"loaded response markdown: {path}")
+
+    def _open_activity_file(self) -> None:
+        """Load a ``.txt`` file into the Activity tab. The Activity
+        view is a ``QTextBrowser`` normally populated with HTML
+        from ``_append_activity_html``; loading replaces that with
+        the plain text of the file via ``setPlainText`` — the user
+        explicitly asked to view this file, so the live-event
+        formatting is the wrong content shape here."""
+        path = self._prompt_open_path(
+            title="Open Text into Activity",
+            file_filter="Text files (*.txt);;All files (*)",
+        )
+        if path is None:
+            return
+        text = self._read_text_file(path, kind_label="text")
+        if text is None:
+            return
+        self.activity_view.setPlainText(text)
+        # Loaded content is now saveable; refresh Save As… state so
+        # the button reflects the new tab content. Same rule as the
+        # _append_* callers.
+        self._update_save_btn_state()
+        # Snap to top so the user starts reading at the beginning,
+        # not where Qt left the cursor after the bulk set.
+        sb = self.activity_view.verticalScrollBar()
+        if sb is not None:
+            sb.setValue(0)
+        self.status_label.setText(f"Loaded activity ← {path.name}")
+        _log(f"loaded activity text: {path}")
+
+    def _open_raw_output_file(self) -> None:
+        """Load a ``.txt`` file into the Raw Output tab. Same shape
+        as ``_open_activity_file`` but writes to the
+        ``QPlainTextEdit`` raw view instead."""
+        path = self._prompt_open_path(
+            title="Open Text into Raw Output",
+            file_filter="Text files (*.txt);;All files (*)",
+        )
+        if path is None:
+            return
+        text = self._read_text_file(path, kind_label="text")
+        if text is None:
+            return
+        self.raw_view.setPlainText(text)
+        # The loaded text belongs to the active view only — we have
+        # no way to know whether the file on disk was a Pretty
+        # transcript or a Raw JSON dump (both save as ``.txt``).
+        # Park the content in the active buffer, blank the other,
+        # and let the toggle reveal an empty alternate view rather
+        # than a stale buffer from the previous run.
+        if self._raw_view_mode == "pretty":
+            self._pretty_buffer_text = text
+            self._raw_buffer_text = ""
+        else:
+            self._raw_buffer_text = text
+            self._pretty_buffer_text = ""
+        self._update_save_btn_state()
+        sb = self.raw_view.verticalScrollBar()
+        if sb is not None:
+            sb.setValue(0)
+        self.status_label.setText(f"Loaded raw output ← {path.name}")
+        _log(f"loaded raw output text: {path}")
+
+    def _prompt_open_path(self, *, title: str, file_filter: str) -> Path | None:
+        """Show the native file-open dialog rooted at the per-window
+        working directory. Returns ``None`` if the user cancelled —
+        no error, no toast, just exit the open flow."""
+        chosen, _ = QFileDialog.getOpenFileName(
+            self,
+            title,
+            str(self._cwd),
+            file_filter,
+        )
+        if not chosen:
+            return None
+        return Path(chosen)
+
+    def _read_text_file(self, path: Path, *, kind_label: str) -> str | None:
+        """Read ``path`` as UTF-8 text. Returns the string on success,
+        ``None`` on failure (after surfacing the failure via
+        ``QMessageBox.warning`` — mirrors ``_write_text_file``'s
+        defense-at-the-boundary discipline so a permission or
+        encoding error doesn't disappear into the log).
+
+        UTF-8 is the only encoding tried — the save path emits UTF-8
+        unconditionally (``_write_text_file``), so files this dialog
+        wrote always round-trip cleanly. Foreign-encoded files
+        produce a clear error rather than silently mojibake."""
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as e:
+            _log(f"open failed: {path}: {e}")
+            QMessageBox.warning(
+                self, "Open failed",
+                f"Could not open {kind_label} file:\n{path}\n\n{e}")
+            return None
+        _log(f"opened {kind_label} ({len(text)} chars): {path}")
+        return text
+
     def _on_cancel(self) -> None:
         """Cancel button (§7.43). Sets the flag and kills the
         subprocess; the worker thread's ``communicate()`` returns
@@ -1906,13 +3164,53 @@ class TestSkillDialog(QDialog):
         self.status_label.setText("Timing out — killing process…")
         self._kill_subproc()
 
+    def _extend_timeout(self, delta_s: int) -> None:
+        """Add ``delta_s`` seconds to the *current* run's timeout
+        (§7.59).
+
+        Increments ``_current_timeout_ms`` so the countdown display
+        (driven by ``_on_tick``) and the eventual TIMED OUT verdict
+        text both see the new total. Then restarts the backing
+        ``_timeout_timer`` with the recomputed remaining slice —
+        ``QTimer.start(msec)`` resets the single-shot from zero, so
+        the extension must be ``new_total - elapsed``, *not*
+        ``delta_s`` (a common off-by-elapsed bug if you forget Qt's
+        timers don't accept "add to existing deadline").
+
+        Per-run only — never touches ``QSettings``. The persisted
+        Help → Settings… default is unchanged for the next Run and
+        the next dialog open."""
+        if not self._is_running() or self._run_started_at is None:
+            return
+        self._current_timeout_ms += delta_s * 1000
+        elapsed_ms = int((time.monotonic() - self._run_started_at)
+                         * 1000)
+        # Guard against pathological clock skew or a delta that
+        # somehow puts the new deadline behind ``now`` — give the
+        # process at least one more second to drain. The +30s / +60s
+        # / +5m presets can't produce this on their own (they only
+        # extend), but the floor is cheap insurance and keeps the
+        # method safe to call from a future "shrink" button.
+        remaining_ms = max(1000,
+                           self._current_timeout_ms - elapsed_ms)
+        self._timeout_timer.start(remaining_ms)
+        new_total_s = self._current_timeout_ms // 1000
+        self._append_both(
+            f"[timeout extended by {delta_s}s — "
+            f"new total {new_total_s}s "
+            f"(approx {remaining_ms // 1000}s remaining)]\n")
+        _log(f"[gui] timeout extended by {delta_s}s; "
+             f"new total {new_total_s}s, "
+             f"remaining {remaining_ms}ms")
+
     def _on_clear(self) -> None:
         """Reset both panes back to the initial state, and explicitly
         forget any captured Claude conversation session (§7.46). Clear
         is the user's "start over" gesture — it should reset *all*
         run-derived state so the next Run is as if the dialog had just
-        opened. Toggling the Continue-conversation checkbox alone does
-        NOT clear the session id; only this button does.
+        opened. With continue-mode now unconditional, Clear is the
+        ONLY way to drop the captured session id mid-dialog; without
+        it, every subsequent Run keeps resuming from the same thread.
 
         Doesn't touch in-flight run state — the GUI thread isn't
         running anything synchronously here (the worker is on its own
@@ -1920,20 +3218,13 @@ class TestSkillDialog(QDialog):
         a run is harmless: it wipes panes but doesn't cancel."""
         self.prompt_edit.clear()
         self._clear_run_views()
+        # In-memory only — there is no persisted state to delete
+        # (§7.68). Dropping the cwd alongside keeps the action-
+        # boundary check honest: an empty (None, None) pair always
+        # produces a fresh-start Run.
         self._session_id = None
-        self._update_session_label()
+        self._session_cwd = None
         self.status_label.setText("Idle")
-
-    def _update_session_label(self) -> None:
-        """Refresh the small ``(session: abc1234…)`` indicator next to
-        the checkboxes. Truncates to the first 8 chars of the id —
-        long enough to recognize across runs, short enough not to
-        crowd the header row. Empty when no session is captured."""
-        if self._session_id:
-            self.session_label.setText(
-                f"(session: {self._session_id[:8]}…)")
-        else:
-            self.session_label.setText("")
 
     def _teardown_process(self) -> None:
         """Stop timers, drop subprocess + worker thread references,
@@ -1952,7 +3243,31 @@ class TestSkillDialog(QDialog):
         self._worker_thread = None
         self.run_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
+        self._open_file_btn.setEnabled(True)
         self.run_busy.hide()
+        for btn in self._extend_buttons:
+            btn.hide()
+        # Snap back to the Response tab now that the run is over —
+        # mirror of the switch-to-Activity at the start of ``_on_run``.
+        # All three reach-the-finish-line callers
+        # (``_on_worker_result``, ``_on_worker_failed``, and the
+        # outer ``_on_run`` try/except) route through here, so this
+        # is the single place to enforce the post-run focus. Every
+        # real-finish path populates Response via
+        # ``_set_response_markdown`` before calling us — even
+        # failure / cancel / timeout — so the snap-back lands on
+        # content the user wants to read (the answer, or a
+        # "see Raw Output" pointer).
+        self._response_tabs.setCurrentIndex(self._SUB_RESPONSE)
+        # Re-evaluate corner button enablement now that the worker
+        # thread is gone (``_is_running()`` is False above this
+        # point). _set_response_markdown was called BEFORE us in
+        # every real-finish path, so Save As… is already in the
+        # right state — but Clear was forced off mid-Run and its
+        # gate (``_is_running()``) only flipped just above. One
+        # call refreshes both via the forward in
+        # _update_save_btn_state.
+        self._update_save_btn_state()
 
     # ---------------------------------------------------------- close handler
     def closeEvent(self, event) -> None:  # noqa: N802 — Qt naming
