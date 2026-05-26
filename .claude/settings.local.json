@@ -46,7 +46,29 @@
       "PowerShell(python -c \"print\\(sum\\(1 for _ in open\\('claude_skills_manager/ui/main_window.py', encoding='utf-8'\\)\\)\\)\")",
       "PowerShell(python -c \"import ast; ast.parse\\(open\\('main.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
       "PowerShell(python -c \"print\\(sum\\(1 for _ in open\\('main.py', encoding='utf-8'\\)\\)\\)\")",
-      "PowerShell(python -c \"print\\(sum\\(1 for _ in open\\('claude_skills_manager/ui/_icons.py', encoding='utf-8'\\)\\)\\)\")"
+      "PowerShell(python -c \"print\\(sum\\(1 for _ in open\\('claude_skills_manager/ui/_icons.py', encoding='utf-8'\\)\\)\\)\")",
+      "PowerShell(python -c \"import ast; ast.parse\\(open\\('claude_skills_manager/ui/skill_list.py', encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('claude_skills_manager/ui/main_window.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "PowerShell(python -c \"import ast; ast.parse\\(open\\('claude_skills_manager/ui/test_dialog.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(QT_QPA_PLATFORM=offscreen python *)",
+      "PowerShell(Test-Path *)",
+      "PowerShell(Get-Item *)",
+      "PowerShell(python -c \"import ast; [ast.parse\\(open\\(p, encoding='utf-8'\\).read\\(\\)\\) for p in ['claude_skills_manager/recycle.py', 'claude_skills_manager/ui/skill_list.py', 'claude_skills_manager/ui/main_window.py']]; print\\('OK'\\)\")",
+      "PowerShell(python -c \"import ast; [ast.parse\\(open\\(p, encoding='utf-8'\\).read\\(\\)\\) for p in ['claude_skills_manager/ui/main_window.py', 'claude_skills_manager/ui/_icons.py']]; print\\('OK'\\)\")",
+      "PowerShell(New-Item *)",
+      "PowerShell(python -c \"import ast; ast.parse\\(open\\('claude_skills_manager/ui/new_skill_dialog.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "PowerShell(python -c \"import ast; [ast.parse\\(open\\(f, encoding='utf-8'\\).read\\(\\)\\) for f in ['claude_skills_manager/scanner.py','claude_skills_manager/ui/main_window.py','main.py']]; print\\('OK'\\)\")",
+      "Bash(awk '{print NR\": \"substr\\($0,1,200\\)}' \"C:/work/Temp2/experiment-dashboard-raw-output.txt\")",
+      "Bash(findstr /r /s \"dragEnterEvent\\\\|dropEvent\\\\|setDragEnabled\\\\|setAcceptDrops\\\\|mimeData\" claude_skills_manager)",
+      "Bash(.venv\\\\Scripts\\\\python.exe -c \"from claude_skills_manager import app_settings, skill_relocate; from claude_skills_manager.ui import test_dialog; print\\('imports OK'\\)\")",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"from claude_skills_manager import app_settings, skill_relocate; from claude_skills_manager.ui import test_dialog; print\\('imports OK'\\)\")",
+      "PowerShell(python -c \"from claude_skills_manager import app_settings, skill_relocate; print\\('non-Qt imports OK'\\)\")",
+      "PowerShell(python -c \"from claude_skills_manager.ui import test_dialog; print\\('test_dialog import OK'\\)\")",
+      "PowerShell(python -c \"from claude_skills_manager.ui import main_window, skill_list; print\\('imports OK'\\)\")",
+      "PowerShell(python -c \"from claude_skills_manager.ui import skill_list; print\\('imports OK'\\)\")",
+      "Bash(grep -n \"View menu\\\\|view menu\" C:\\\\\\\\work\\\\\\\\claude_demo\\\\\\\\Claude_Skills_Manager_GUI\\\\\\\\DESIGN.md)",
+      "Bash(grep -iE \"\\(view menu|view$|menu order\\)\")",
+      "PowerShell(python -c \"import ast; ast.parse\\(open\\('claude_skills_manager/app_settings.py', encoding='utf-8'\\).read\\(\\)\\); print\\('app_settings.py OK'\\)\"; python -c \"import ast; ast.parse\\(open\\('claude_skills_manager/ui/settings_dialog.py', encoding='utf-8'\\).read\\(\\)\\); print\\('settings_dialog.py OK'\\)\")",
+      "PowerShell(python -c \"import ast; ast.parse\\(open\\('claude_skills_manager/ui/settings_dialog.py', encoding='utf-8'\\).read\\(\\)\\); print\\('settings_dialog.py OK'\\)\")"
     ]
   }
 }

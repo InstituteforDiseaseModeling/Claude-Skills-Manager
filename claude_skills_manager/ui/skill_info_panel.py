@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 from ..models import Skill
 from ..skill_md import estimated_token_count
 from ..skill_settings import (
-    BINARY_STATES, STATE_OFF, STATE_ON,
+    BINARY_STATES, STATE_OFF, STATE_ON, STATE_PLUGIN_OFF,
 )
 from ._styles import BUTTON_STYLE
 
@@ -167,36 +167,51 @@ class SkillInfoPanel(QWidget):
 
     # ----------------------------------------------------------- state helpers
     def _render_state(self, skill: Skill) -> None:
-        """Populate the State row from `skill.state` and `skill.plugin_id`."""
-        is_plugin = skill.plugin_id is not None
-        is_binary = skill.state in BINARY_STATES
+        """Populate the State row from `skill.state` and
+        `skill.override_state`.
 
+        Per-skill Enable/Disable applies only when the parent plugin
+        is enabled — for plugin-off rows both buttons are disabled
+        with a tooltip pointing the user at `/plugin` (§7.63
+        decision 3). The override-vs-composed-state divergence in
+        the underlying model is preserved (so write paths stay
+        correct), but the GUI doesn't expose it: scoping the
+        affordance to the common case keeps the UI honest.
+
+        For non-binary overrides (`name-only` /
+        `user-invocable-only`) the toggle is read-only with a
+        tooltip directing the user to `settings.local.json` —
+        same treatment as Global/Project."""
         # Default: both buttons off; the branches below re-enable as needed.
         self._enable_btn.setEnabled(False)
         self._disable_btn.setEnabled(False)
         self._enable_btn.setToolTip("")
         self._disable_btn.setToolTip("")
 
-        if is_plugin:
-            label = "Enabled" if skill.state == STATE_ON else "Disabled"
-            self._state_label.setText(
-                f"{label}  (controlled by plugin: {skill.plugin_id})")
-            tip = "Plugin skills can't be toggled individually — manage via /plugin"
+        if skill.state == STATE_PLUGIN_OFF:
+            plugin_suffix = (f"  (plugin disabled: {skill.plugin_id})"
+                             if skill.plugin_id else "")
+            self._state_label.setText(f"Disabled{plugin_suffix}")
+            tip = ("Plugin is currently disabled — enable it via /plugin "
+                   "in Claude Code to manage this skill")
             self._enable_btn.setToolTip(tip)
             self._disable_btn.setToolTip(tip)
             return
 
-        if not is_binary:
+        if skill.override_state not in BINARY_STATES:
             self._state_label.setText(
-                f"{skill.state}  (read-only — edit settings.local.json to change)")
-            tip = (f"State is '{skill.state}'. Toggling here would collapse the "
-                   f"nuance — edit settings.local.json by hand to change it.")
+                f"{skill.override_state}  "
+                f"(read-only — edit settings.local.json to change)")
+            tip = (f"Override is '{skill.override_state}'. Toggling here "
+                   f"would collapse the nuance — edit settings.local.json "
+                   f"by hand to change it.")
             self._enable_btn.setToolTip(tip)
             self._disable_btn.setToolTip(tip)
             return
 
-        # Binary, toggleable.
-        if skill.state == STATE_ON:
+        # Binary, toggleable. Same control flow for Global, Project, and
+        # plugin-enabled Plugin skills.
+        if skill.override_state == STATE_ON:
             self._state_label.setText("Enabled")
             self._disable_btn.setEnabled(True)
         else:

@@ -128,7 +128,17 @@ def main() -> int:
     window = MainWindow(defer_initial_scan=True)
 
     splash.set_status("Scanning skills…")
-    window.refresh()
+    # Pass app.processEvents as the scanner's progress pump (§7.62)
+    # so the splash's indeterminate marquee actually animates during
+    # the scan. Without this, the sync scan blocks the main thread
+    # and Qt's animation tick never fires — the marquee appears
+    # frozen. F5 / Refresh / Choose-root paths intentionally don't
+    # pump (they pass on_progress=None), since pumping while
+    # MainWindow is visible could process queued user input
+    # mid-scan; the splash startup is the only window where the
+    # pump is unambiguously safe (no interactive widgets are on
+    # screen besides the splash itself).
+    window.refresh(on_progress=app.processEvents)
 
     splash.close()
     window.show()

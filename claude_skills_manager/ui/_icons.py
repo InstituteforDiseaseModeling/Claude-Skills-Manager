@@ -306,7 +306,7 @@ def eye_slash_icon() -> QIcon:
 
 def close_icon() -> QIcon:
     """Small X glyph for the per-row "close window" affordance on the
-    View menu.
+    Window menu.
 
     Two crossed diagonal strokes centered in a 32×32 canvas with DPR=2,
     matching the rest of the icon set (same stroke weight, same
