@@ -137,7 +137,7 @@ class SkillScanner:
           referenced directly by their installLocation path.
         """
         standard = _iter_subdirs(self.home / ".claude" / "plugins" / "marketplaces")
-        directory = self._iter_directory_marketplaces(self.home)
+        directory = self._iter_directory_marketplaces()
         return [
             skill
             for marketplace in itertools.chain(standard, directory)
