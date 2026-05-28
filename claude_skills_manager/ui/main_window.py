@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QSettings, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
+from PySide6.QtGui import QAction, QActionGroup, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QDialog, QFileDialog, QHBoxLayout, QLabel,
     QLineEdit, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton,
@@ -59,6 +59,18 @@ _TOOLBAR_LOGO_SIZE = 24
 
 _ORG = "ClaudeSkillsManager"
 _APP = "ClaudeSkillsManager"
+
+# Resource-menu sort modes, persisted under the QSettings key
+# ``resource_sort``. ``default`` preserves the row order of
+# ``ai_tools.md`` as parsed (so users can hand-curate ordering via
+# Edit Resource…); the other two are pure alphabetical on the tool
+# name, case-insensitive.
+_RESOURCE_SORT_DEFAULT = "default"
+_RESOURCE_SORT_ASC = "asc"
+_RESOURCE_SORT_DESC = "desc"
+_RESOURCE_SORT_VALID = (
+    _RESOURCE_SORT_DEFAULT, _RESOURCE_SORT_ASC, _RESOURCE_SORT_DESC,
+)
 
 # Quick allow-list of "definitely text"; anything else falls through to the
 # null-byte sniff in `_is_text_file`.
@@ -147,6 +159,52 @@ class _WindowMenuRow(QWidget):
         # on the title area, which means "raise."
         self.raise_requested.emit()
         super().mousePressEvent(event)
+
+
+class _StayOpenMenu(QMenu):
+    """A QMenu that does NOT collapse the menu chain when one of its
+    *checkable* actions is activated. Used for the Resource → Sort by
+    submenu so the user can flip between sort modes without the parent
+    Resource menu closing under them on every click.
+
+    Qt's default ``QMenu.mouseReleaseEvent`` and ``keyPressEvent``
+    activate the action AND close the entire menu chain back to the
+    menu bar — both behaviours live in the same code path. The
+    canonical "stay open" idiom is to override those two events,
+    call ``action.trigger()`` manually (which emits ``triggered`` and
+    toggles the checked state), and ``return`` without chaining to
+    ``super()``. The close-chain logic in ``super()`` never runs, so
+    the menu stays open; the activation logic runs explicitly via
+    ``trigger()``. The QActionGroup that owns the checkable actions
+    repaints itself on the state flip, so the new check-mark gutter
+    glyph appears in place without further work.
+
+    Non-checkable actions fall through to ``super()`` unchanged —
+    callers can mix transient actions into the same menu and they
+    behave normally (activate + close). Today the Sort submenu only
+    holds the three radio actions, but keeping the fall-through is
+    cheap defence against future additions."""
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 — Qt naming
+        action = self.activeAction()
+        if action is not None and action.isCheckable() and action.isEnabled():
+            action.trigger()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 — Qt naming
+        # Keyboard parity with the mouse-release path. Without this,
+        # arrow-key navigation followed by Space / Enter would still
+        # close the menu chain because Qt's default keyPressEvent
+        # is where the activation+close path lives for keys.
+        if event.key() in (Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter):
+            action = self.activeAction()
+            if action is not None and action.isCheckable() and action.isEnabled():
+                action.trigger()
+                event.accept()
+                return
+        super().keyPressEvent(event)
 
 
 class MainWindow(QMainWindow):
@@ -1113,29 +1171,191 @@ class MainWindow(QMainWindow):
         SettingsDialog(self).exec()
 
     def _populate_resource_menu(self) -> None:
-        """Rebuild the Resource menu from the packaged ``ai_tools.md``
-        table. Called at startup and after Edit Resource… commits a
-        save (so the rebuild path is reused, not duplicated).
+        """Build the Resource menu structure. Called exactly once,
+        from ``_build_ui`` at startup.
 
-        Layout: pinned "Edit Resource…" at the top, separator, then
-        one QAction per parsed AITool. Empty list → no dynamic
-        entries, but Edit Resource… stays available so the user can
-        still add the first row."""
-        tools = load_ai_tools()
+        Layout (top to bottom):
+
+        * A ``QLineEdit`` search field embedded via ``QWidgetAction``
+          — case-insensitive substring filter on tool name. Cleared
+          and refocused on every menu open (see
+          ``_on_resource_menu_about_to_show``) so search is
+          transient and predictable.
+        * Separator.
+        * Pinned "Edit Resource…".
+        * "Sort by" submenu carrying three exclusive radio entries
+          (Default ai order / A→Z / Z→A).
+        * Separator.
+        * One QAction per parsed AITool — sorted by the persisted
+          user preference (QSettings key ``resource_sort``) and
+          filtered by the current search text.
+
+        Why the one-shot full build (vs. rebuilding from scratch
+        every time): clicking a sort radio while the Sort submenu is
+        open must not tear the submenu down — that would collapse
+        the menu chain mid-click and defeat ``_StayOpenMenu``. Sort
+        changes, search keystrokes, and Edit Resource… saves all
+        route through ``_render_tool_actions`` instead, which
+        touches only the tool QActions below the *last* separator
+        and leaves the search box, Edit Resource…, the Sort
+        submenu, and its action group intact."""
         self._resource_menu.clear()
+
+        # Search field at the top — QLineEdit hosted by a
+        # QWidgetAction so the line edit captures its own keystrokes
+        # without dismissing the menu. Wrapped in a small container
+        # widget purely for padding; bare QLineEdits inside QMenus
+        # look cramped against the menu's edge. ClearButton lets the
+        # user wipe the filter via mouse without clicking through the
+        # whole field.
+        search_container = QWidget()
+        search_layout = QHBoxLayout(search_container)
+        search_layout.setContentsMargins(6, 4, 6, 4)
+        self._resource_search_edit = QLineEdit()
+        self._resource_search_edit.setPlaceholderText("Search resources…")
+        self._resource_search_edit.setClearButtonEnabled(True)
+        self._resource_search_edit.setMinimumWidth(240)
+        # Leading search-glyph icon. Reuses the codebase's existing
+        # search_icon() (the toolbar's filter affordance) for visual
+        # consistency across the app.
+        self._resource_search_edit.addAction(
+            search_icon(), QLineEdit.LeadingPosition)
+        # textChanged fires per-keystroke — _render_tool_actions is
+        # cheap (small lists, just QAction creation), so no debounce
+        # needed. The slot ignores the emitted str argument and
+        # re-reads from the line edit, so the same render path works
+        # from every caller (sort change, edit-resource save, keystroke).
+        self._resource_search_edit.textChanged.connect(
+            lambda _text="": self._render_tool_actions())
+        search_layout.addWidget(self._resource_search_edit)
+
+        search_action = QWidgetAction(self._resource_menu)
+        search_action.setDefaultWidget(search_container)
+        self._resource_menu.addAction(search_action)
+        self._resource_menu.addSeparator()
 
         edit_action = QAction("&Edit Resource…", self)
         edit_action.triggered.connect(self._open_edit_resource_dialog)
         self._resource_menu.addAction(edit_action)
+
+        # Sort submenu — ``_StayOpenMenu`` keeps the parent Resource
+        # menu open when a radio is clicked, so the user can compare
+        # sort modes without re-summoning Resource each time. The
+        # QActionGroup is parented to the submenu (Qt cleans both up
+        # together when the main window is destroyed).
+        sort_menu = _StayOpenMenu("&Sort by", self._resource_menu)
+        self._resource_menu.addMenu(sort_menu)
+        sort_group = QActionGroup(sort_menu)
+        sort_group.setExclusive(True)
+        initial_mode = self._resource_sort_mode()
+        for mode, label in (
+            (_RESOURCE_SORT_DEFAULT, "&Default (ai order)"),
+            (_RESOURCE_SORT_ASC, "A → Z"),
+            (_RESOURCE_SORT_DESC, "Z → A"),
+        ):
+            act = QAction(label, sort_group)
+            act.setCheckable(True)
+            if mode == initial_mode:
+                act.setChecked(True)
+            # ``m=mode`` freezes the value at iteration time — same
+            # late-binding guard as the per-tool lambda below.
+            act.triggered.connect(
+                lambda _checked=False, m=mode: self._set_resource_sort(m))
+            sort_menu.addAction(act)
+
         self._resource_menu.addSeparator()
+
+        # Wire menu-open behaviour: clear the search field and hand
+        # focus to it. Done here (after the line edit exists) and
+        # connected exactly once because _populate_resource_menu is
+        # itself one-shot per main-window lifetime.
+        self._resource_menu.aboutToShow.connect(
+            self._on_resource_menu_about_to_show)
+
+        # Tool entries live below the last separator and are
+        # re-rendered in place whenever the sort changes, the search
+        # text changes, or Edit Resource… commits a save.
+        self._render_tool_actions()
+
+    def _on_resource_menu_about_to_show(self) -> None:
+        """Reset the search field and focus it whenever the Resource
+        menu opens.
+
+        Clearing the field triggers ``textChanged`` →
+        ``_render_tool_actions``, so the tool list also refreshes
+        against the current ``ai_tools.md`` state — covers the
+        otherwise-missed case where the file is mutated by Edit
+        Resource… while the menu is closed.
+
+        ``setActiveAction(None)`` un-arms the first menu item so a
+        stray Enter on the line edit can't accidentally trigger Edit
+        Resource…. Focus has to be set via ``QTimer.singleShot(0,
+        …)`` because ``aboutToShow`` fires *before* the menu is
+        actually shown — calling ``setFocus()`` directly on a
+        still-hidden widget gets re-routed away once the menu
+        becomes visible."""
+        self._resource_search_edit.clear()
+        self._resource_menu.setActiveAction(None)
+        QTimer.singleShot(0, self._resource_search_edit.setFocus)
+
+    def _render_tool_actions(self) -> None:
+        """Replace the tool QActions at the bottom of the Resource
+        menu with a freshly-loaded, filtered, and sorted list.
+        Touches *only* the actions below the *last* separator —
+        the search box, Edit Resource…, the Sort submenu, and the
+        intermediate separators are preserved so a click in any of
+        them (especially the still-open Sort submenu, see
+        ``_StayOpenMenu``) doesn't yank the menu chain out from
+        under the user.
+
+        Last-separator (not first) because the search field
+        introduced a second separator above Edit Resource…; the
+        tool list begins after whichever separator comes last,
+        regardless of how many sit above it. Robust against future
+        menu restructuring without further changes here.
+
+        Three terminal states:
+
+        * ``(no resources available)`` — ``ai_tools.md`` parsed to an
+          empty list (fresh install, malformed file, etc.).
+        * ``(no matches)`` — file has tools but the current search
+          filter hides them all.
+        * One QAction per surviving tool — the normal path.
+
+        Removed QActions are ``deleteLater``-ed because
+        ``removeAction`` only unlinks them from the menu; they
+        would otherwise accumulate as dangling children of
+        ``self._resource_menu`` across every keystroke and sort
+        change."""
+        tools = load_ai_tools()
+        sort_mode = self._resource_sort_mode()
+        query = self._resource_search_text()
+
+        actions = self._resource_menu.actions()
+        last_sep_idx: int | None = None
+        for i, a in enumerate(actions):
+            if a.isSeparator():
+                last_sep_idx = i
+        if last_sep_idx is not None:
+            for stale in actions[last_sep_idx + 1:]:
+                self._resource_menu.removeAction(stale)
+                stale.deleteLater()
 
         if not tools:
             placeholder = QAction("(no resources available)", self._resource_menu)
             placeholder.setEnabled(False)
             self._resource_menu.addAction(placeholder)
             return
-        for tool in tools:
-            act = QAction(tool.name, self)
+
+        filtered = self._filtered_tools(tools, query)
+        if not filtered:
+            placeholder = QAction("(no matches)", self._resource_menu)
+            placeholder.setEnabled(False)
+            self._resource_menu.addAction(placeholder)
+            return
+
+        for tool in self._sorted_tools(filtered, sort_mode):
+            act = QAction(tool.name, self._resource_menu)
             # ``t=tool`` freezes the binding at iteration time —
             # without it, Python's late closure binding would have
             # every entry open the dialog for the *last* tool.
@@ -1143,18 +1363,86 @@ class MainWindow(QMainWindow):
                 lambda _checked=False, t=tool: self._open_ai_tool_dialog(t))
             self._resource_menu.addAction(act)
 
+    def _resource_search_text(self) -> str:
+        """Current search filter text, stripped of surrounding
+        whitespace. Returns ``""`` when the line edit hasn't been
+        constructed yet — covers the narrow window between
+        ``MainWindow.__init__`` and ``_build_ui``'s
+        ``_populate_resource_menu`` call, during which the attribute
+        does not yet exist."""
+        edit = getattr(self, "_resource_search_edit", None)
+        return edit.text().strip() if edit is not None else ""
+
+    @staticmethod
+    def _filtered_tools(tools: list[AITool], query: str) -> list[AITool]:
+        """Case-insensitive substring match on tool name only.
+        Empty / whitespace-only query returns ``tools`` unchanged so
+        the no-filter path is a no-op.
+
+        Name-only by design (per UX choice): users typically know
+        what the tool is called, and matching summary text would
+        return surprising hits like "Anthropic" matching every row
+        that mentions Anthropic in its description."""
+        if not query:
+            return tools
+        q = query.lower()
+        return [t for t in tools if q in t.name.lower()]
+
+    def _resource_sort_mode(self) -> str:
+        """Return the persisted Resource-menu sort mode.
+
+        Unknown / missing values collapse to the default file-order
+        mode — covers fresh installs (no key yet) and the unlikely
+        case of a hand-edited registry value outside the valid set.
+        """
+        mode = QSettings(_ORG, _APP).value(
+            "resource_sort", _RESOURCE_SORT_DEFAULT)
+        if isinstance(mode, str) and mode in _RESOURCE_SORT_VALID:
+            return mode
+        return _RESOURCE_SORT_DEFAULT
+
+    def _set_resource_sort(self, mode: str) -> None:
+        """Persist ``mode`` and re-render *only* the tool list so the
+        new order takes effect immediately while the Sort submenu —
+        which the user is actively clicking in — stays open. The
+        ``_StayOpenMenu`` mouseReleaseEvent override has already
+        prevented the menu chain from closing; here we just refresh
+        the data the user will see when they navigate back to the
+        parent Resource menu."""
+        QSettings(_ORG, _APP).setValue("resource_sort", mode)
+        self._render_tool_actions()
+
+    @staticmethod
+    def _sorted_tools(tools: list[AITool], mode: str) -> list[AITool]:
+        """Apply ``mode`` to ``tools`` and return the ordered list.
+
+        ``default`` returns ``tools`` unchanged (preserving the row
+        order users curate via Edit Resource…); the alphabetical
+        modes sort case-insensitively on the tool name."""
+        if mode == _RESOURCE_SORT_ASC:
+            return sorted(tools, key=lambda t: t.name.lower())
+        if mode == _RESOURCE_SORT_DESC:
+            return sorted(tools, key=lambda t: t.name.lower(), reverse=True)
+        return tools
+
     def _open_ai_tool_dialog(self, tool: AITool) -> None:
         AIToolDialog(tool, self).exec()
 
     def _open_edit_resource_dialog(self) -> None:
-        """Open the modal CRUD editor. Always refresh the Resource
-        menu when the dialog closes — Save no longer accepts the
-        dialog (it persists in-place so the user can keep editing),
-        so the old ``if exec() == Accepted`` guard would never fire.
+        """Open the modal CRUD editor. Always refresh the tool list
+        when the dialog closes — Save no longer accepts the dialog
+        (it persists in-place so the user can keep editing), so the
+        old ``if exec() == Accepted`` guard would never fire.
         Reading the file is cheap and idempotent, so unconditional
-        refresh is the simplest correct behaviour."""
+        refresh is the simplest correct behaviour.
+
+        ``_render_tool_actions`` (rather than ``_populate_resource_menu``)
+        is the right entry point: the dialog can change tool rows
+        but not the user's sort preference or the Sort submenu, so a
+        full rebuild would needlessly tear down ``_StayOpenMenu`` and
+        its action group."""
         EditResourceDialog(self).exec()
-        self._populate_resource_menu()
+        self._render_tool_actions()
 
     def _open_about_dialog(self) -> None:
         AboutDialog(self).exec()
