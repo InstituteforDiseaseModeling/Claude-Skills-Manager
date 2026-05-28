@@ -230,13 +230,6 @@ class MainWindow(QMainWindow):
         self._scanner = SkillScanner()
         self._project_root: Path | None = None
         self._current_skill: Skill | None = None
-        # Tracks whether the search box was empty as of the last
-        # textChanged event. ``_on_search_changed`` resets the current
-        # selection on empty <-> non-empty transitions only — not on
-        # every keystroke while the search stays non-empty — so a dirty
-        # file doesn't trigger the Discard prompt repeatedly while the
-        # user types. See §7.27 for the full state-machine.
-        self._search_was_empty = True
         # Guard so the (idempotent but allocating) Windows taskbar
         # binding only fires on the first show, not on every restore
         # from minimized state.
@@ -424,15 +417,15 @@ class MainWindow(QMainWindow):
                    self.cb_enabled, self.cb_disabled):
             cb.setChecked(True)
         self.cb_global.toggled.connect(
-            lambda v: self.skill_list.set_type_enabled(SkillType.GLOBAL, v))
+            lambda v: self._on_type_filter_toggled(SkillType.GLOBAL, v))
         self.cb_project.toggled.connect(
-            lambda v: self.skill_list.set_type_enabled(SkillType.PROJECT, v))
+            lambda v: self._on_type_filter_toggled(SkillType.PROJECT, v))
         self.cb_plugin.toggled.connect(
-            lambda v: self.skill_list.set_type_enabled(SkillType.PLUGIN, v))
+            lambda v: self._on_type_filter_toggled(SkillType.PLUGIN, v))
         self.cb_enabled.toggled.connect(
-            lambda v: self.skill_list.set_state_group_enabled(STATE_GROUP_ENABLED, v))
+            lambda v: self._on_state_filter_toggled(STATE_GROUP_ENABLED, v))
         self.cb_disabled.toggled.connect(
-            lambda v: self.skill_list.set_state_group_enabled(STATE_GROUP_DISABLED, v))
+            lambda v: self._on_state_filter_toggled(STATE_GROUP_DISABLED, v))
 
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search skills…")
@@ -638,53 +631,67 @@ class MainWindow(QMainWindow):
     def _on_search_changed(self, text: str) -> None:
         """Search-box ``textChanged`` handler.
 
-        The skill-list filter updates on every keystroke. Reset of the
-        middle/right panels fires in exactly the cases that leave the
-        left list with **no visually-selectable highlight** for the
-        previously-current skill:
+        Visibility-driven: applies the new filter, then delegates to
+        the shared ``_reset_view_after_filter_change`` — same
+        contract as the Type/State checkbox toggles. If the current
+        skill is still visible under the new query the highlight
+        gets re-asserted and the panels stay populated; if it's
+        filtered out, the panels clear.
 
-        * **empty → non-empty** / **non-empty → empty** (boundary
-          transitions): the "context change" / "start over" gestures
-          from §7.27. Reset regardless of whether the current skill
-          still matches — typing a fresh query is itself the deselect.
-        * **non-empty → non-empty refinement** *that filtered the
-          current skill out of view* (§7.61): without this case, the
-          state machine in §7.27 leaves middle/right populated with a
-          skill the user can no longer see in the left list. Probed
-          via ``select_skill`` — its side effect of *restoring* the
-          tree highlight is desirable too, because every
-          ``_rebuild()`` (one per keystroke) clears the visual
-          selection along with the old items.
-        * All other non-empty → non-empty refinements: no-op. The
-          per-keystroke ``confirm_close`` prompt is avoided exactly
-          because we only fall into the reset branch when visibility
-          actually changes — typing within a stable result set just
-          re-asserts the same selection.
-
-        If the editor has unsaved changes, ``confirm_close()`` prompts.
-        On Cancel we keep the current skill and the panels' content;
-        the user has to save/discard before the next transition
-        triggers a new prompt — same handshake pattern as
-        ``refresh()``."""
+        Per-keystroke ``confirm_close`` prompts are naturally
+        suppressed because the clear branch only runs when
+        ``select_skill`` returns False — i.e. visibility actually
+        changed. Typing within a stable result set just re-asserts
+        the same selection without entering the prompt path."""
         self.skill_list.set_filter(text)
-        empty_now = not text
-        was_empty = self._search_was_empty
-        self._search_was_empty = empty_now
+        self._reset_view_after_filter_change()
 
+    def _on_type_filter_toggled(self, type_: SkillType, enabled: bool) -> None:
+        """Toolbar Type checkbox handler.
+
+        Wraps ``skill_list.set_type_enabled`` with the same
+        middle/right reset gesture the search box uses on a context
+        change (§7.27): after the rebuild drops the tree's visual
+        highlight, the populated middle/right panels would otherwise
+        show a skill the user can no longer see selected. Symmetric
+        with ``_on_state_filter_toggled``; both delegate the reset
+        to ``_reset_view_after_filter_change``."""
+        self.skill_list.set_type_enabled(type_, enabled)
+        self._reset_view_after_filter_change()
+
+    def _on_state_filter_toggled(self, group: str, enabled: bool) -> None:
+        """Toolbar State checkbox handler. Mirrors
+        ``_on_type_filter_toggled`` for the Enabled / Disabled
+        State group."""
+        self.skill_list.set_state_group_enabled(group, enabled)
+        self._reset_view_after_filter_change()
+
+    def _reset_view_after_filter_change(self) -> None:
+        """Reconcile the middle/right panels with the rebuilt skill list.
+
+        Visibility-driven: shared by ``_on_search_changed`` and the
+        Type/State toggle handlers. Three branches:
+
+        * **No skill currently selected** — nothing to reconcile.
+          Short-circuits the synchronous ``toggled`` emissions
+          during ``_restore_settings`` (called after signal wiring
+          with no skill selected yet).
+        * **Current skill still visible** — re-assert the tree
+          highlight (``_rebuild`` dropped it along with the old
+          items) and leave the middle/right panels untouched. This
+          is the common case: filter changes that don't affect
+          what's selected don't disturb the user's editing context.
+        * **Current skill filtered out** — clear panels and
+          selection so the right side doesn't display a skill the
+          user can no longer see in the left list. Unsaved edits
+          surface a ``confirm_close`` prompt; cancelling it leaves
+          the panels populated with no left-side highlight (same
+          shape as the rejected-switch path in
+          ``on_skill_selected``)."""
         if self._current_skill is None:
             return
-
-        boundary = (was_empty != empty_now)
-        if not boundary:
-            # Non-empty → non-empty (or the no-op empty → empty path,
-            # which select_skill handles harmlessly). If the current
-            # skill is still visible under the new filter, re-select
-            # it — _rebuild dropped the tree's visual selection along
-            # with the old item set — and bail. Otherwise fall through
-            # to the panel-reset branch (§7.61 bug fix).
-            if self.skill_list.select_skill(self._current_skill):
-                return
-
+        if self.skill_list.select_skill(self._current_skill):
+            return
         if not self.editor_panel.confirm_close():
             return
         self._current_skill = None
@@ -692,11 +699,8 @@ class MainWindow(QMainWindow):
         self.skill_info.clear()
         self.editor_panel.clear()
         self.skill_list.clear_selection()
-        # No ``_busy`` here — the search-clear transition does no I/O,
-        # so a full loading indicator would lie. A brief status-bar
-        # flash is the honest acknowledgment (§7.33).
-        message = "View cleared — start typing or pick a skill"
-        self.statusBar().showMessage(message, 2500)
+        self.statusBar().showMessage(
+            "Selected skill no longer matches — view cleared", 2500)
 
     @contextmanager
     def _busy(self, message: str):
@@ -1184,7 +1188,7 @@ class MainWindow(QMainWindow):
         * Separator.
         * Pinned "Edit Resource…".
         * "Sort by" submenu carrying three exclusive radio entries
-          (Default ai order / A→Z / Z→A).
+          (default file order / A→Z / Z→A).
         * Separator.
         * One QAction per parsed AITool — sorted by the persisted
           user preference (QSettings key ``resource_sort``) and
@@ -1249,7 +1253,7 @@ class MainWindow(QMainWindow):
         sort_group.setExclusive(True)
         initial_mode = self._resource_sort_mode()
         for mode, label in (
-            (_RESOURCE_SORT_DEFAULT, "&Default (ai order)"),
+            (_RESOURCE_SORT_DEFAULT, "&Default (file order)"),
             (_RESOURCE_SORT_ASC, "A → Z"),
             (_RESOURCE_SORT_DESC, "Z → A"),
         ):
@@ -1842,32 +1846,28 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def _save_settings(self) -> None:
+        # Type / State checkbox states are intentionally NOT persisted.
+        # Each launch starts with all five filters checked (the
+        # ``setChecked(True)`` defaults in ``_build_toolbar``) so the
+        # user sees the full skill inventory on open and applies
+        # filters fresh per session. Stale ``show_*`` keys from
+        # earlier builds are actively removed so they don't linger in
+        # the registry forever.
         s = QSettings(_ORG, _APP)
         s.setValue("project_root", str(self._project_root) if self._project_root else "")
-        s.setValue("show_global",   self.cb_global.isChecked())
-        s.setValue("show_project",  self.cb_project.isChecked())
-        s.setValue("show_plugin",   self.cb_plugin.isChecked())
-        s.setValue("show_enabled",  self.cb_enabled.isChecked())
-        s.setValue("show_disabled", self.cb_disabled.isChecked())
+        for stale in ("show_global", "show_project", "show_plugin",
+                      "show_enabled", "show_disabled"):
+            s.remove(stale)
         s.setValue("geometry",      self.saveGeometry())
         s.setValue("state",         self.saveState())
 
     def _restore_settings(self) -> None:
+        # Filter checkboxes deliberately skipped — see ``_save_settings``.
         s = QSettings(_ORG, _APP)
         root = s.value("project_root") or ""
         if root and Path(root).exists():
             self._project_root = Path(root)
             self._update_root_label()
-        for cb, key in (
-            (self.cb_global,   "show_global"),
-            (self.cb_project,  "show_project"),
-            (self.cb_plugin,   "show_plugin"),
-            (self.cb_enabled,  "show_enabled"),
-            (self.cb_disabled, "show_disabled"),
-        ):
-            v = s.value(key)
-            if v is not None:
-                cb.setChecked(_truthy(v))
         geom = s.value("geometry")
         if geom is not None:
             self.restoreGeometry(geom)
@@ -1886,14 +1886,6 @@ def _section_label(text: str) -> QLabel:
     lbl.setTextFormat(Qt.RichText)
     lbl.setStyleSheet("padding:0 8px;")
     return lbl
-
-
-def _truthy(v: object) -> bool:
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, (int, float)):
-        return bool(v)
-    return str(v).lower() in {"true", "1", "yes", "on"}
 
 
 def _is_text_file(path: Path) -> bool:
